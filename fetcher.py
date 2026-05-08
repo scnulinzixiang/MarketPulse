@@ -12,7 +12,7 @@ import urllib.request
 from datetime import datetime
 from typing import Optional
 
-from config import BATCH_SIZE, SINA_PAGE_SIZE
+from config import BATCH_SIZE, BATCH_DELAY, SINA_PAGE_SIZE
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
@@ -43,7 +43,7 @@ def _request_gbk(url: str, timeout: int = 15) -> Optional[str]:
 
 # ── 全市场股票列表 ────────────────────────────────────────────────────────
 
-def fetch_stock_list() -> list[dict]:
+def fetch_stock_list(max_retries: int = 3) -> list[dict]:
     """
     从 Sina Market Center 分页获取全量A股代码
     返回 [{code, name, exchange}, ...]
@@ -63,14 +63,22 @@ def fetch_stock_list() -> list[dict]:
                 f"?page={page}&num={SINA_PAGE_SIZE}&sort=symbol&asc=1"
                 f"&node={node}&symbol=&_s_r_a=init"
             )
-            text = _request(url)
+            text = None
+            for attempt in range(max_retries):
+                text = _request(url, timeout=20)
+                if text:
+                    break
+                time.sleep(2)
             if not text:
+                print(f"  [fetcher] {exchange} 第{page}页获取失败（重试{max_retries}次后放弃）", flush=True)
                 break
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
+                print(f"  [fetcher] {exchange} 第{page}页JSON解析失败", flush=True)
                 break
             if not isinstance(data, list) or len(data) == 0:
+                print(f"  [fetcher] {exchange} 第{page}页为空，列表获取完成", flush=True)
                 break
             for item in data:
                 if isinstance(item, dict):
@@ -83,10 +91,11 @@ def fetch_stock_list() -> list[dict]:
                             "exchange": exchange,
                             "short_code": code,
                         })
+            print(f"  [fetcher] {exchange} 第{page}页: {len(data)}只 (累计{len(stocks)})", flush=True)
             if len(data) < SINA_PAGE_SIZE:
                 break
             page += 1
-            time.sleep(0.3)  # 避免频率过高
+            time.sleep(0.5)  # 避免频率过高
 
     return stocks
 
@@ -179,17 +188,21 @@ def fetch_quotes_batch(codes: list[str]) -> dict:
 
 def fetch_all_quotes(codes: list[str], batch_size: int = BATCH_SIZE) -> dict:
     """
-    分批获取全市场行情
+    顺序分批获取全市场行情
     返回 {tencent_code: {...}}
     """
     all_quotes = {}
     total = len(codes)
+    batches = (total + batch_size - 1) // batch_size
     for i in range(0, total, batch_size):
         batch = codes[i:i + batch_size]
         quotes = fetch_quotes_batch(batch)
         all_quotes.update(quotes)
+        batch_num = i // batch_size + 1
+        if batch_num % 10 == 0 or batch_num == batches:
+            print(f"  [fetcher] 批次 {batch_num}/{batches}, 本批{len(quotes)}只, 累计{len(all_quotes)}只", flush=True)
         if i + batch_size < total:
-            time.sleep(0.5)  # 限速
+            time.sleep(BATCH_DELAY)
     return all_quotes
 
 

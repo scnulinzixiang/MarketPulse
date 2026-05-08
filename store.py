@@ -169,6 +169,17 @@ def get_latest_snapshot_ts() -> Optional[datetime]:
     return None
 
 
+def get_latest_snapshot_count() -> int:
+    """获取最新快照的股票数量"""
+    conn = get_conn()
+    row = conn.execute("""
+        SELECT COUNT(*) as cnt FROM snapshots
+        WHERE ts = (SELECT MAX(ts) FROM snapshots)
+    """).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
 # ── 板块快照 ──────────────────────────────────────────────────────────────
 
 def save_sector_snapshot(data: dict):

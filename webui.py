@@ -15,7 +15,10 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store
+import main as m
 from analysis import compute_sector_aggregates, compute_market_breadth, analyze_sector_trends
+
+_scan_lock = threading.Lock()
 
 
 def get_latest_snapshot():
@@ -55,8 +58,17 @@ def get_market_overview():
     else:
         sentiment = "震荡"
 
+    # SQLite CURRENT_TIMESTAMP 存的是 UTC，转为北京时间 (UTC+8)
+    ts = str(row["ts"])
+    try:
+        from datetime import datetime, timedelta
+        dt = datetime.fromisoformat(ts) + timedelta(hours=8)
+        ts = dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
     return {
-        "ts": str(row["ts"]),
+        "ts": ts,
         "total": row["total"],
         "up": row["up"],
         "down": row["down"],
@@ -130,11 +142,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _run_scan(self):
         """在后台线程中执行扫描"""
         def scan():
-            try:
-                import main as m
-                m.run_scan_and_report(no_notify=True)
-            except Exception as e:
-                print(f"Scan error: {e}")
+            with _scan_lock:
+                try:
+                    if store.get_stock_count() == 0:
+                        m.ensure_stock_list()
+                    m.run_scan_and_report(no_notify=True)
+                except Exception as e:
+                    print(f"Scan error: {e}")
         t = threading.Thread(target=scan, daemon=True)
         t.start()
         self._json_response({"status": "started"})
@@ -256,16 +270,23 @@ canvas{display:block;width:100%;height:240px}
 const API = '';
 
 async function fetchJSON(url) {
-  const r = await fetch(API + url);
-  return r.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const r = await fetch(API + url, { signal: controller.signal });
+    clearTimeout(timer);
+    return r.json();
+  } catch (e) {
+    clearTimeout(timer);
+    return null;
+  }
 }
 
 // 渲染概览卡片
-async function renderOverview() {
-  const data = await fetchJSON('/api/overview');
+function renderOverview(data) {
   const grid = document.getElementById('overviewGrid');
   if (!data) {
-    grid.innerHTML = '<div class="card"><div class="label">暂无数据</div><div class="value" style="font-size:14px;color:#888">请先执行一次扫描</div></div>';
+    grid.innerHTML = '<div class="card"><div class="label">暂无数据</div><div class="value" style="font-size:14px;color:#888">首次扫描中，请稍候...</div></div>';
     return;
   }
   const s = data.sentiment;
@@ -296,8 +317,7 @@ async function renderOverview() {
 }
 
 // 渲染板块排名
-async function renderSectors() {
-  const sectors = await fetchJSON('/api/sectors');
+function renderSectors(sectors) {
   const tbody = document.getElementById('sectorBody');
   if (!sectors.length) {
     tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666;padding:20px">暂无板块数据</td></tr>';
@@ -325,8 +345,7 @@ async function renderSectors() {
 }
 
 // 绘制板块分布图
-async function renderChart() {
-  const sectors = await fetchJSON('/api/sectors');
+function renderChart(sectors) {
   const canvas = document.getElementById('sectorChart');
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
@@ -396,34 +415,40 @@ async function triggerScan() {
   const btn = document.getElementById('scanBtn');
   btn.textContent = '⏳ 扫描中…';
   btn.classList.add('scanning');
+  // 记录扫描前的时间戳
+  const before = await fetchJSON('/api/overview');
+  const beforeTs = before ? before.ts : null;
   await fetchJSON('/api/scan');
-  // 轮询等待结果
+  // 轮询等待扫描完成（时间戳变化）
   let waited = 0;
   const poll = setInterval(async () => {
     waited += 5;
     const d = await fetchJSON('/api/overview');
-    // 检查扫描是否完成：overview 更新时间变化说明有新数据
-    if (d) {
+    const done = d && d.ts && d.ts !== beforeTs;
+    if (done || waited > 180) {
       clearInterval(poll);
       scanning = false;
       btn.textContent = '🔄 重新扫描';
       btn.classList.remove('scanning');
-      refreshAll();
-    } else if (waited > 300) {
-      clearInterval(poll);
-      scanning = false;
-      btn.textContent = '🔄 重新扫描';
-      btn.classList.remove('scanning');
+      if (done) refreshAll();
     }
   }, 5000);
 }
 
 // 主动刷新，不过度频繁
 let autoTimer;
-function refreshAll() {
-  renderOverview();
-  renderSectors();
-  renderChart();
+let sectorsCache = null;
+
+async function refreshAll() {
+  // 并行请求概览和板块数据
+  const [overview, sectors] = await Promise.all([
+    fetchJSON('/api/overview'),
+    fetchJSON('/api/sectors')
+  ]);
+  sectorsCache = sectors;
+  renderOverview(overview);
+  renderSectors(sectors);
+  renderChart(sectors);
 }
 
 // 初始化 + 自动刷新
@@ -431,7 +456,7 @@ refreshAll();
 autoTimer = setInterval(refreshAll, 30000);
 
 // 窗口大小变化时重绘图表
-window.addEventListener('resize', () => { renderChart(); });
+window.addEventListener('resize', () => { if (sectorsCache) renderChart(sectorsCache); });
 </script>
 </body>
 </html>"""
@@ -440,15 +465,44 @@ window.addEventListener('resize', () => { renderChart(); });
 def main():
     parser = argparse.ArgumentParser(description="市场监控 Web 仪表盘")
     parser.add_argument("--port", type=int, default=8080, help="监听端口")
+    parser.add_argument("--scan-interval", type=int, default=180, help="自动扫描间隔(秒)")
     args = parser.parse_args()
 
     store.init_db()
+
+    # 确保股票池就绪
+    m.ensure_stock_list()
+
+    # 后台初始扫描（不阻塞服务器启动）
+    def initial_scan():
+        print("正在执行初始扫描...")
+        try:
+            m.run_scan_and_report(no_notify=True)
+            print("初始扫描完成")
+        except Exception as e:
+            print(f"初始扫描异常: {e}")
+
+    threading.Thread(target=initial_scan, daemon=True).start()
+
+    # 后台自动扫描（仅交易时间）
+    def auto_scan():
+        while True:
+            time.sleep(args.scan_interval)
+            try:
+                if m.is_trading_time():
+                    with _scan_lock:
+                        m.run_scan_and_report(no_notify=True)
+            except Exception as e:
+                print(f"[AutoScan] {e}")
+
+    threading.Thread(target=auto_scan, daemon=True).start()
 
     server = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print(f"")
     print(f"  🌐 全市场资金趋势仪表盘")
     print(f"  ─────────────────────────")
     print(f"  地址: http://localhost:{args.port}")
+    print(f"  自动扫描: 每{args.scan_interval}秒")
     print(f"  按 Ctrl+C 停止")
     print(f"")
 

@@ -12,19 +12,44 @@ from config import SECTOR_MAP, KNOWN_STOCKS, SECTOR_KEYWORDS
 from config import MARKET_BREADTH_CONFIG, TREND_CONFIG
 
 
+# ── 东财行业分类缓存 ──────────────────────────────────────────────────────
+
+_stock_sector_cache = None
+
+def _load_stock_sectors() -> dict:
+    """从数据库加载东方行业分类映射"""
+    global _stock_sector_cache
+    if _stock_sector_cache is not None:
+        return _stock_sector_cache
+    try:
+        import store as _s
+        conn = _s.get_conn()
+        rows = conn.execute("SELECT code, sector_name FROM stock_industries").fetchall()
+        conn.close()
+        _stock_sector_cache = {r["code"]: r["sector_name"] for r in rows}
+    except Exception:
+        _stock_sector_cache = {}
+    return _stock_sector_cache
+
+
 # ── 板块分类 ──────────────────────────────────────────────────────────────
 
 def classify_stock(code: str, name: str) -> str:
     """
     将股票归类到行业板块
-    优先级: KNOWN_STOCKS > SECTOR_MAP(代码范围) > SECTOR_KEYWORDS(名称)
+    优先级: KNOWN_STOCKS > stock_industries(东方行业) > SECTOR_MAP(代码范围) > SECTOR_KEYWORDS(名称)
     """
     # 1. 已知股票精确匹配
     short_code = _extract_short_code(code)
     if short_code in KNOWN_STOCKS:
         return KNOWN_STOCKS[short_code]
 
-    # 2. 代码范围匹配
+    # 2. 东方行业分类（最准确，覆盖 ~3200 只）
+    sector_map = _load_stock_sectors()
+    if len(short_code) == 6 and short_code in sector_map:
+        return sector_map[short_code]
+
+    # 3. 代码范围匹配
     # code 格式为 sh600519 或 sz300750
     exchange = code[:2] if len(code) >= 2 else ""
     num_part = _extract_num(code)

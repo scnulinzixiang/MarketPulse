@@ -68,15 +68,20 @@ def should_refresh_stocks() -> bool:
 
 def ensure_stock_list():
     """确保股票池已初始化"""
-    if not should_refresh_stocks():
-        count = store.get_stock_count()
-        if count > 0:
-            log(f"股票池已就绪（{count} 只）")
-            return
+    cached_count = store.get_stock_count()
+
+    if not should_refresh_stocks() and cached_count > 0:
+        log(f"股票池已就绪（{cached_count} 只）")
+        return
 
     log("正在获取全市场股票列表...")
     stocks = fetcher.fetch_stock_list()
-    if stocks:
+    if stocks and len(stocks) >= max(cached_count * 0.8, 1000):
+        store.save_stocks(stocks)
+        log(f"股票列表已更新（{len(stocks)} 只，原{cached_count}只）")
+    elif cached_count > 0:
+        log(f"新获取股票数过少（{len(stocks) if stocks else 0}只），保留缓存（{cached_count}只）")
+    elif stocks:
         store.save_stocks(stocks)
         log(f"股票列表已保存（{len(stocks)} 只）")
     else:
@@ -105,6 +110,12 @@ def run_scan_and_report(no_notify: bool = False):
         return None
 
     log(f"获取完成（{len(quotes)} 只有效, {elapsed:.0f}s）")
+
+    # 检查新数据是否比缓存更完整，避免不完整扫描覆盖好数据
+    cached_count = store.get_latest_snapshot_count()
+    if cached_count > 0 and len(quotes) < cached_count * 0.8:
+        log(f"本次扫描结果不完整（{len(quotes)}只 < 缓存{cached_count}只*0.8），跳过保存")
+        return None
 
     # 保存快照
     store.save_snapshots_batch(list(quotes.values()))
