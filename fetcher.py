@@ -41,6 +41,21 @@ def _request_gbk(url: str, timeout: int = 15) -> Optional[str]:
         return None
 
 
+def _request_with_retry(url: str, timeout: int = 15, max_retries: int = 3) -> Optional[str]:
+    """带重试的HTTP GET请求"""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                return None
+    return None
+
+
 # ── 全市场股票列表 ────────────────────────────────────────────────────────
 
 def fetch_stock_list(max_retries: int = 3) -> list[dict]:
@@ -245,3 +260,127 @@ def fetch_avg_volume(code: str, days: int = 5) -> float:
     if not volumes:
         return 0
     return sum(volumes) / len(volumes)
+
+
+# ── 东方财富资金流向 ──────────────────────────────────────────────────────
+
+def fetch_sector_moneyflow() -> list[dict]:
+    """
+    东方财富行业板块资金流向
+    返回 [{sector_name, main_net_inflow(亿), main_net_ratio(%), ...}]
+    """
+    url = ("https://push2.eastmoney.com/api/qt/clist/get"
+           "?fields=f12,f14,f62,f184,f66,f69,f72,f75,f78,f81"
+           "&fltt=2&pn=1&pz=200&fs=m:90+t:2&fid=f62"
+           "&ut=b2884a393a59ad64002ef1a68bbbdc4e")
+    text = _request_with_retry(url, timeout=15)
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    diff = data.get("data", {}).get("diff", {})
+    if not isinstance(diff, dict):
+        return []
+
+    result = []
+    for item in diff.values():
+        if not isinstance(item, dict):
+            continue
+        try:
+            result.append({
+                "sector_name": str(item.get("f14", "")),
+                "main_net_inflow": float(item.get("f62", 0) or 0) / 1e8,
+                "main_net_ratio": float(item.get("f184", 0) or 0),
+                "big_net_inflow": float(item.get("f66", 0) or 0) / 1e8,
+                "mid_net_inflow": float(item.get("f72", 0) or 0) / 1e8,
+                "small_net_inflow": float(item.get("f78", 0) or 0) / 1e8,
+            })
+        except (ValueError, TypeError):
+            continue
+
+    return sorted(result, key=lambda x: x["main_net_inflow"], reverse=True)
+
+
+def fetch_stock_moneyflow_top(top_n: int = 30) -> list[dict]:
+    """
+    东方财富个股资金流向榜 Top N
+    返回 [{code, name, price, main_net_inflow(亿), main_net_ratio(%)}]
+    """
+    url = ("https://push2.eastmoney.com/api/qt/clist/get"
+           "?fields=f12,f14,f2,f62,f184&fltt=2"
+           f"&pn=1&pz={top_n}"
+           "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+           "&fid=f62&ut=b2884a393a59ad64002ef1a68bbbdc4e")
+    text = _request_with_retry(url, timeout=15)
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    diff = data.get("data", {}).get("diff", {})
+    if not isinstance(diff, dict):
+        return []
+
+    result = []
+    for item in diff.values():
+        if not isinstance(item, dict):
+            continue
+        try:
+            result.append({
+                "code": str(item.get("f12", "")),
+                "name": str(item.get("f14", "")),
+                "price": float(item.get("f2", 0) or 0),
+                "main_net_inflow": float(item.get("f62", 0) or 0) / 1e8,
+                "main_net_ratio": float(item.get("f184", 0) or 0),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    return sorted(result, key=lambda x: x["main_net_inflow"], reverse=True)
+
+
+# ── 热点池（成交额排名）─────────────────────────────────────────────────
+
+def fetch_top_stocks_by_amount(top_n: int = 300) -> list[dict]:
+    """
+    从东方财富获取成交额排名前N只股票
+    用于快循环监控池
+    """
+    url = ("https://push2.eastmoney.com/api/qt/clist/get"
+           "?fields=f12,f14,f2,f3,f4,f20"
+           "&fltt=2"
+           f"&pn=1&pz={top_n}"
+           "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+           "&fid=f20&ut=b2884a393a59ad64002ef1a68bbbdc4e")
+    text = _request_with_retry(url, timeout=15)
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    diff = data.get("data", {}).get("diff", {})
+    if not isinstance(diff, dict):
+        return []
+
+    result = []
+    for item in diff.values():
+        if not isinstance(item, dict):
+            continue
+        try:
+            result.append({
+                "code": str(item.get("f12", "")),
+                "name": str(item.get("f14", "")),
+                "price": float(item.get("f2", 0) or 0),
+                "change_pct": float(item.get("f3", 0) or 0),
+                "amount": float(item.get("f20", 0) or 0) / 1e8,
+            })
+        except (ValueError, TypeError):
+            continue
+    return result
