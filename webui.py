@@ -582,7 +582,7 @@ async function refreshAll() {
 
 // 初始化 + 自动刷新
 refreshAll();
-autoTimer = setInterval(refreshAll, 30000);
+autoTimer = setInterval(refreshAll, 10000);
 
 // 窗口大小变化时重绘图表
 window.addEventListener('resize', () => { if (sectorsCache) renderChart(sectorsCache); });
@@ -594,7 +594,7 @@ window.addEventListener('resize', () => { if (sectorsCache) renderChart(sectorsC
 def main():
     parser = argparse.ArgumentParser(description="市场监控 Web 仪表盘")
     parser.add_argument("--port", type=int, default=8080, help="监听端口")
-    parser.add_argument("--scan-interval", type=int, default=180, help="自动扫描间隔(秒)")
+    parser.add_argument("--scan-interval", type=int, default=120, help="全量扫描间隔(秒)")
     args = parser.parse_args()
 
     store.init_db()
@@ -613,25 +613,39 @@ def main():
 
     threading.Thread(target=initial_scan, daemon=True).start()
 
-    # 后台自动扫描（仅交易时间）
-    def auto_scan():
+    # 双循环自动扫描
+    # - 快循环(60s): 热点池300只，秒级完成
+    # - 慢循环(5min): 全量5000只+资金流向
+    def auto_scan_loop():
+        last_full = 0
         while True:
-            time.sleep(args.scan_interval)
+            time.sleep(30)
+            if not m.is_trading_time():
+                continue
+            now = time.time()
             try:
-                if m.is_trading_time():
+                # 快循环：热点池
+                with _scan_lock:
+                    hot = fetcher.fetch_top_stocks_by_amount(300)
+                    if hot:
+                        print(f"[快] 热点池 {len(hot)}只 更新", flush=True)
+                # 慢循环：全量
+                if now - last_full >= args.scan_interval:
+                    last_full = now
                     with _scan_lock:
                         m.run_scan_and_report(no_notify=True)
+                        print(f"[慢] 全量扫描完成", flush=True)
             except Exception as e:
-                print(f"[AutoScan] {e}")
+                print(f"[Scan] {e}", flush=True)
 
-    threading.Thread(target=auto_scan, daemon=True).start()
+    threading.Thread(target=auto_scan_loop, daemon=True).start()
 
     server = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print(f"")
     print(f"  🌐 全市场资金趋势仪表盘")
     print(f"  ─────────────────────────")
     print(f"  地址: http://localhost:{args.port}")
-    print(f"  自动扫描: 每{args.scan_interval}秒")
+    print(f"  快循环: 30秒(热点池) | 慢循环: 每{args.scan_interval}秒(全量)")
     print(f"  按 Ctrl+C 停止")
     print(f"")
 
