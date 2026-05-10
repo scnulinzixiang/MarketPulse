@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import store
 import main as m
+import fetcher
 from analysis import compute_sector_aggregates, compute_market_breadth, analyze_sector_trends
 
 _scan_lock = threading.Lock()
@@ -129,6 +130,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     bar_color = "#f59e0b"
                 overview["bar_color"] = bar_color
             self._json_response(overview)
+        elif self.path == "/api/moneyflow/sectors":
+            self._json_response(fetcher.fetch_sector_moneyflow())
+        elif self.path == "/api/moneyflow/stocks":
+            self._json_response(fetcher.fetch_stock_moneyflow_top(20))
+        elif self.path == "/api/ai":
+            self._generate_ai()
         else:
             self._serve_html()
 
@@ -152,6 +159,35 @@ class DashboardHandler(BaseHTTPRequestHandler):
         t = threading.Thread(target=scan, daemon=True)
         t.start()
         self._json_response({"status": "started"})
+
+    def _generate_ai(self):
+        """生成 AI 市场点评（服务器端调用 DeepSeek，key 不暴露给前端）"""
+        try:
+            snap = get_latest_snapshot()
+            if not snap:
+                self._json_response({"error": "no_data"})
+                return
+            sectors = snap["sectors"]
+            conn = store.get_conn()
+            row = conn.execute("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) as up,
+                       SUM(CASE WHEN change_pct < 0 THEN 1 ELSE 0 END) as down,
+                       ROUND(SUM(amount)/10000, 0) as total_amount_yi
+                FROM snapshots WHERE ts = (SELECT MAX(ts) FROM snapshots)
+            """).fetchone()
+            conn.close()
+            breadth = {
+                "up": row["up"] or 0, "down": row["down"] or 0,
+                "limit_up": 0, "limit_down": 0,
+                "total_amount": row["total_amount_yi"] or 0,
+            }
+            moneyflow = fetcher.fetch_sector_moneyflow()
+            from ai_advisor import generate_market_commentary
+            commentary = generate_market_commentary(breadth, sectors, moneyflow, [])
+            self._json_response({"text": commentary, "ts": str(datetime.now())})
+        except Exception as e:
+            self._json_response({"error": str(e)})
 
     def _serve_html(self):
         self.send_response(200)
@@ -224,6 +260,28 @@ canvas{display:block;width:100%;height:240px}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:#0f0f13}
 ::-webkit-scrollbar-thumb{background:#2a2a3a;border-radius:3px}
+
+/* Moneyflow Tables */
+.mf-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+@media(max-width:768px){.mf-grid{grid-template-columns:1fr}}
+.mf-table{width:100%;border-collapse:collapse;font-size:12px}
+.mf-table th{text-align:left;padding:6px 8px;border-bottom:1px solid #26263a;color:#888;font-weight:500;font-size:11px}
+.mf-table td{padding:6px 8px;border-bottom:1px solid #1a1a22;font-size:12px}
+.inflow{color:#22c55e}
+.outflow{color:#ef4444}
+
+/* AI Commentary */
+.ai-card{background:linear-gradient(135deg,#1a1a26,#1a1a2e);border:1px solid #2a2a4a;border-radius:10px;
+  padding:16px;margin-bottom:20px}
+.ai-card .ai-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.ai-card .ai-label{font-size:13px;color:#818cf8;font-weight:600}
+.ai-card .ai-time{font-size:11px;color:#666}
+.ai-card .ai-body{font-size:13px;line-height:1.7;color:#d0d0d0;white-space:pre-wrap}
+.ai-card .ai-empty{color:#555;font-size:13px;font-style:italic}
+.ai-card .ai-btn{background:#2a2a4a;border:1px solid #3a3a5a;color:#818cf8;padding:4px 12px;
+  border-radius:4px;cursor:pointer;font-size:12px}
+.ai-card .ai-btn:hover{background:#3a3a5a}
+.ai-card .ai-btn.loading{opacity:.5;pointer-events:none}
 </style>
 </head>
 <body>
@@ -263,6 +321,39 @@ canvas{display:block;width:100%;height:240px}
       </thead>
       <tbody id="sectorBody"></tbody>
     </table>
+  </div>
+
+  <!-- 资金流向 -->
+  <div class="chart-container">
+    <h3>主力资金流向 <span style="font-weight:400;color:#666;font-size:12px">东方财富数据</span></h3>
+    <div class="mf-grid">
+      <div>
+        <h4 style="color:#22c55e;font-size:13px;margin-bottom:8px">净流入 TOP</h4>
+        <table class="mf-table" id="inflowTable">
+          <thead><tr><th>板块</th><th style="text-align:right">主力净流入</th><th style="text-align:right">净占比</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div>
+        <h4 style="color:#ef4444;font-size:13px;margin-bottom:8px">净流出 TOP</h4>
+        <table class="mf-table" id="outflowTable">
+          <thead><tr><th>板块</th><th style="text-align:right">主力净流出</th><th style="text-align:right">净占比</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- AI 点评 -->
+  <div class="ai-card">
+    <div class="ai-header">
+      <div class="ai-label">AI 市场研判</div>
+      <div>
+        <span class="ai-time" id="aiTime"></span>
+        <button class="ai-btn" id="aiBtn" onclick="fetchAI()">生成点评</button>
+      </div>
+    </div>
+    <div class="ai-empty" id="aiBody">点击"生成点评"获取 DeepSeek 市场分析</div>
   </div>
 </div>
 
@@ -407,6 +498,43 @@ function renderChart(sectors) {
   ctx.stroke();
 }
 
+
+// 渲染资金流向
+function renderMoneyflow(sectors) {
+  if (!sectors || !sectors.length) return;
+  const inflow = [...sectors].filter(s => s.main_net_inflow > 0).slice(0, 8);
+  const outflow = [...sectors].filter(s => s.main_net_inflow < 0).slice(-8).reverse();
+  document.querySelector("#inflowTable tbody").innerHTML = inflow.length
+    ? inflow.map(s => "<tr><td>"+s.sector_name+"</td><td class="inflow" style="text-align:right">+"+s.main_net_inflow.toFixed(1)+"亿</td><td style="text-align:right;color:#888">"+s.main_net_ratio.toFixed(1)+"%</td></tr>").join("")
+    : "<tr><td colspan="3" style="text-align:center;color:#555">暂无净流入</td></tr>";
+  document.querySelector("#outflowTable tbody").innerHTML = outflow.length
+    ? outflow.map(s => "<tr><td>"+s.sector_name+"</td><td class="outflow" style="text-align:right">"+s.main_net_inflow.toFixed(1)+"亿</td><td style="text-align:right;color:#888">"+s.main_net_ratio.toFixed(1)+"%</td></tr>").join("")
+    : "<tr><td colspan="3" style="text-align:center;color:#555">暂无净流出</td></tr>";
+}
+
+// AI 点评（调用服务器端 /api/ai，key 不暴露）
+let aiLoading = false;
+async function fetchAI() {
+  if (aiLoading) return;
+  aiLoading = true;
+  const btn = document.getElementById("aiBtn");
+  const body = document.getElementById("aiBody");
+  btn.textContent = "分析中…";
+  btn.classList.add("loading");
+  body.className = "ai-body";
+  body.textContent = "正在分析市场数据…";
+  const res = await fetchJSON("/api/ai");
+  if (res && res.text) {
+    body.textContent = res.text;
+    document.getElementById("aiTime").textContent = res.ts ? res.ts.slice(11,19) : "";
+  } else {
+    body.textContent = "暂无数据，请先执行扫描。";
+  }
+  aiLoading = false;
+  btn.textContent = "刷新点评";
+  btn.classList.remove("loading");
+}
+
 // 触发扫描
 let scanning = false;
 async function triggerScan() {
@@ -440,15 +568,16 @@ let autoTimer;
 let sectorsCache = null;
 
 async function refreshAll() {
-  // 并行请求概览和板块数据
-  const [overview, sectors] = await Promise.all([
+  const [overview, sectors, moneyflow] = await Promise.all([
     fetchJSON('/api/overview'),
-    fetchJSON('/api/sectors')
+    fetchJSON('/api/sectors'),
+    fetchJSON('/api/moneyflow/sectors')
   ]);
   sectorsCache = sectors;
   renderOverview(overview);
   renderSectors(sectors);
   renderChart(sectors);
+  renderMoneyflow(moneyflow);
 }
 
 // 初始化 + 自动刷新
