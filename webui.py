@@ -125,7 +125,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(get_market_overview())
         elif self.path == "/api/sectors":
             snap = get_latest_snapshot()
-            self._json_response(snap["sectors"] if snap else [])
+            sectors = snap["sectors"] if snap else []
+            if sectors:
+                # 合并趋势评分
+                daily_data = store.get_all_sector_daily(days_back=10)
+                score_map = {}
+                for sector_name, data in daily_data.items():
+                    if len(data) >= 3:
+                        score_map[sector_name] = score_trend_strength(data)
+                for s in sectors:
+                    s["trend_score"] = score_map.get(s["sector_name"])
+            self._json_response(sectors)
         elif self.path == "/api/history":
             self._json_response(get_sector_history())
         elif self.path.startswith("/api/scan"):
