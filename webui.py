@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -110,6 +111,12 @@ def get_sector_history(days=30):
 # ═══════════════════════════════════════════════════════════════════
 # HTTP 处理器
 # ═══════════════════════════════════════════════════════════════════
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Threaded version of HTTPServer for concurrent request handling"""
+    allow_reuse_address = True
+    daemon_threads = True
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
 
@@ -879,7 +886,7 @@ def main():
 
     threading.Thread(target=auto_scan_loop, daemon=True).start()
 
-    server = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
+    server = ThreadedHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print(f"")
     print(f"  🌐 全市场资金趋势仪表盘")
     print(f"  ─────────────────────────")
