@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -58,18 +58,17 @@ def get_market_overview():
         return None
 
     up_ratio = round(row["up"] / row["total"] * 100, 1) if row["total"] > 0 else 0
-    if up_ratio > 60:
+    if up_ratio > 55:
         sentiment = "强势"
-    elif up_ratio < 30:
+    elif up_ratio < 45:
         sentiment = "弱势"
     else:
         sentiment = "震荡"
 
-    # SQLite CURRENT_TIMESTAMP 存的是 UTC，转为北京时间 (UTC+8)
+    # 数据存储使用北京时间 (UTC+8)，直接解析即可
     ts = str(row["ts"])
     try:
-        from datetime import datetime, timedelta
-        dt = datetime.fromisoformat(ts) + timedelta(hours=8)
+        dt = datetime.fromisoformat(ts)
         ts = dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         pass
@@ -128,7 +127,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             overview = get_market_overview()
             if overview:
                 up_ratio = overview["up_ratio"]
-                if up_ratio > 60:
+                if up_ratio > 55:
                     bar_color = "#22c55e"
                 elif up_ratio < 30:
                     bar_color = "#ef4444"
@@ -203,7 +202,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             moneyflow = fetcher.fetch_sector_moneyflow()
             from ai_advisor import generate_market_commentary
             commentary = generate_market_commentary(breadth, sectors, moneyflow, [])
-            self._json_response({"text": commentary, "ts": str(datetime.now())})
+            self._json_response({"text": commentary, "ts": str(datetime.now(tz=timezone(timedelta(hours=8))))})
         except Exception as e:
             self._json_response({"error": str(e)})
 
@@ -422,7 +421,7 @@ function renderOverview(data) {
     </div>
     <div class="card">
       <div class="label">上涨占比</div>
-      <div class="value ${data.up_ratio > 60 ? 'up' : data.up_ratio < 30 ? 'down' : 'flat'}">${data.up_ratio}%</div>
+      <div class="value ${data.up_ratio > 55 ? 'up' : data.up_ratio < 45 ? 'down' : 'flat'}">${data.up_ratio}%</div>
       <div class="sub">共 ${data.total} 只交易</div>
     </div>
     <div class="card">

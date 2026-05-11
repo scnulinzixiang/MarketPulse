@@ -4,10 +4,15 @@ SQLite持久化模块
 
 import os
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from typing import Optional
 
 from config import DB_PATH
+
+
+def _now_cn() -> str:
+    """返回北京时间字符串 yyyy-mm-dd HH:MM:SS"""
+    return datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def get_db_path() -> str:
@@ -93,8 +98,8 @@ def save_stocks(stocks: list[dict]):
     conn = get_conn()
     cursor = conn.cursor()
     cursor.executemany(
-        "INSERT OR REPLACE INTO stocks (code, name, exchange, short_code) VALUES (?, ?, ?, ?)",
-        [(s["code"], s["name"], s.get("exchange", ""), s.get("short_code", "")) for s in stocks]
+        "INSERT OR REPLACE INTO stocks (code, name, exchange, short_code, added_at) VALUES (?, ?, ?, ?, ?)",
+        [(s["code"], s["name"], s.get("exchange", ""), s.get("short_code", ""), _now_cn()) for s in stocks]
     )
     conn.commit()
     conn.close()
@@ -130,12 +135,12 @@ def save_snapshot(snap: dict):
     conn = get_conn()
     conn.execute(
         """INSERT INTO snapshots (code, name, price, change_pct, volume, amount,
-           turnover_rate, high, low, open, pre_close)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           turnover_rate, high, low, open, pre_close, ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (snap["code"], snap.get("name"), snap.get("price"),
          snap.get("change_pct"), snap.get("volume"), snap.get("amount"),
          snap.get("turnover_rate"), snap.get("high"), snap.get("low"),
-         snap.get("open"), snap.get("pre_close"))
+         snap.get("open"), snap.get("pre_close"), _now_cn())
     )
     conn.commit()
     conn.close()
@@ -144,13 +149,15 @@ def save_snapshot(snap: dict):
 def save_snapshots_batch(snapshots: list[dict]):
     """批量保存行情快照"""
     conn = get_conn()
+    ts = _now_cn()
     conn.executemany(
         """INSERT INTO snapshots (code, name, price, change_pct, volume, amount,
-           turnover_rate, high, low, open, pre_close)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        [(s["code"], s.get("name"), s.get("price"), s.get("change_pct"),
-          s.get("volume"), s.get("amount"), s.get("turnover_rate"),
-          s.get("high"), s.get("low"), s.get("open"), s.get("pre_close"))
+           turnover_rate, high, low, open, pre_close, ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        [(s["code"], s.get("name"), s.get("price"),
+          s.get("change_pct"), s.get("volume"), s.get("amount"),
+          s.get("turnover_rate"), s.get("high"), s.get("low"),
+          s.get("open"), s.get("pre_close"), ts)
          for s in snapshots]
     )
     conn.commit()
@@ -187,13 +194,13 @@ def save_sector_snapshot(data: dict):
     conn = get_conn()
     conn.execute(
         """INSERT INTO sector_snapshots (sector_name, stock_count, avg_change,
-           up_count, down_count, total_volume, total_amount, max_change, min_change)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           up_count, down_count, total_volume, total_amount, max_change, min_change, ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (data["sector_name"], data.get("stock_count", 0),
          data.get("avg_change", 0), data.get("up_count", 0),
          data.get("down_count", 0), data.get("total_volume", 0),
          data.get("total_amount", 0), data.get("max_change", 0),
-         data.get("min_change", 0))
+         data.get("min_change", 0), _now_cn())
     )
     conn.commit()
     conn.close()
@@ -202,13 +209,14 @@ def save_sector_snapshot(data: dict):
 def save_sector_snapshots_batch(sectors: list[dict]):
     """批量保存板块快照"""
     conn = get_conn()
+    ts = _now_cn()
     conn.executemany(
         """INSERT INTO sector_snapshots (sector_name, stock_count, avg_change,
-           up_count, down_count, total_volume, total_amount, max_change, min_change)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           up_count, down_count, total_volume, total_amount, max_change, min_change, ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         [(s["sector_name"], s.get("stock_count", 0), s.get("avg_change", 0),
           s.get("up_count", 0), s.get("down_count", 0), s.get("total_volume", 0),
-          s.get("total_amount", 0), s.get("max_change", 0), s.get("min_change", 0))
+          s.get("total_amount", 0), s.get("max_change", 0), s.get("min_change", 0), ts)
          for s in sectors]
     )
     conn.commit()

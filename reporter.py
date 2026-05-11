@@ -3,7 +3,7 @@
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 
@@ -19,11 +19,11 @@ def send_notification(title: str, message: str, sound: bool = False):
 
 
 def fmt_time() -> str:
-    return datetime.now().strftime("%H:%M")
+    return datetime.now(tz=timezone(timedelta(hours=8))).strftime("%H:%M")
 
 
 def fmt_date() -> str:
-    return datetime.now().strftime("%m-%d")
+    return datetime.now(tz=timezone(timedelta(hours=8))).strftime("%m-%d")
 
 
 # ── 市场趋势报告 ──────────────────────────────────────────────────────────

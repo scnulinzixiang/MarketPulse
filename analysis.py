@@ -6,6 +6,7 @@
 """
 
 from datetime import datetime, timedelta
+import time
 from typing import Optional
 
 from config import SECTOR_MAP, KNOWN_STOCKS, SECTOR_KEYWORDS
@@ -15,11 +16,14 @@ from config import MARKET_BREADTH_CONFIG, TREND_CONFIG
 # ── 东财行业分类缓存 ──────────────────────────────────────────────────────
 
 _stock_sector_cache = None
+_stock_sector_cache_time = 0  # 缓存时间戳
 
 def _load_stock_sectors() -> dict:
-    """从数据库加载东方行业分类映射"""
-    global _stock_sector_cache
-    if _stock_sector_cache is not None:
+    """从数据库加载东方行业分类映射，惰性加载 + 缓存时效检查"""
+    global _stock_sector_cache, _stock_sector_cache_time
+    now = time.time()
+    # 缓存有效期为30秒，避免重复查询
+    if _stock_sector_cache is not None and (now - _stock_sector_cache_time) < 30:
         return _stock_sector_cache
     try:
         import store as _s
@@ -27,9 +31,20 @@ def _load_stock_sectors() -> dict:
         rows = conn.execute("SELECT code, sector_name FROM stock_industries").fetchall()
         conn.close()
         _stock_sector_cache = {r["code"]: r["sector_name"] for r in rows}
+        _stock_sector_cache_time = now
     except Exception:
-        _stock_sector_cache = {}
+        if _stock_sector_cache is None:
+            _stock_sector_cache = {}
+        _stock_sector_cache_time = now
     return _stock_sector_cache
+
+
+def reload_stock_sectors():
+    """强制重新加载行业分类映射"""
+    global _stock_sector_cache, _stock_sector_cache_time
+    _stock_sector_cache = None
+    _stock_sector_cache_time = 0
+    return _load_stock_sectors()
 
 
 # ── 板块分类 ──────────────────────────────────────────────────────────────

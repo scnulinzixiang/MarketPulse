@@ -41,16 +41,25 @@ def _request_gbk(url: str, timeout: int = 15) -> Optional[str]:
         return None
 
 
-def _request_with_retry(url: str, timeout: int = 15, max_retries: int = 3) -> Optional[str]:
-    """带重试的HTTP GET请求"""
+def _request_with_retry(url: str, timeout: int = 20, max_retries: int = 3) -> Optional[str]:
+    """带重试和指数退避的HTTP GET请求（用于东方财富 push2 接口，限流时加倍等待）"""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    delay = 2
     for attempt in range(max_retries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 429:
+                    raise Exception("HTTP 429 Too Many Requests")
                 return resp.read().decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as e:
             if attempt < max_retries - 1:
-                time.sleep(2)
+                # 指数退避：限流时加倍等待，最多60秒
+                err_str = str(e).lower()
+                if "429" in err_str or "refused" in err_str or "timeout" in err_str or "reset" in err_str:
+                    delay = min(delay * 2, 60)
+                else:
+                    delay = min(delay + 1, 10)
+                time.sleep(delay)
             else:
                 return None
     return None

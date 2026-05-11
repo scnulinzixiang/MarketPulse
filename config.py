@@ -3,7 +3,7 @@
 """
 
 # ── 交易时间配置 ──────────────────────────────────────────────────────────
-TRADING_START = (9, 25)
+TRADING_START = (9, 30)  # 连续竞价开始
 TRADING_END = (15, 0)
 MORNING_END = (11, 30)
 AFTERNOON_START = (13, 0)

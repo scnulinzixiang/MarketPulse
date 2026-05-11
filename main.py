@@ -10,7 +10,7 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,14 +27,14 @@ def log(msg: str):
 
 
 def is_trading_time() -> bool:
-    now = datetime.now()
+    now = datetime.now(tz=timezone(timedelta(hours=8)))
     t = (now.hour, now.minute)
     if t < TRADING_START or t >= TRADING_END:
         return False
     am_end = MORNING_END[0] * 60 + MORNING_END[1]
     pm_start = AFTERNOON_START[0] * 60 + AFTERNOON_START[1]
     t_min = t[0] * 60 + t[1]
-    if am_end < t_min < pm_start:
+    if am_end <= t_min < pm_start:
         return False
     return now.weekday() < 5
 
@@ -43,7 +43,7 @@ def should_refresh_stocks() -> bool:
     last = store.get_stock_last_update()
     if last is None:
         return True
-    return (datetime.now() - last) > timedelta(days=STOCK_REFRESH_DAYS)
+    return (datetime.now(tz=timezone(timedelta(hours=8))) - last) > timedelta(days=STOCK_REFRESH_DAYS)
 
 
 def ensure_stock_list():
@@ -135,7 +135,7 @@ def main_loop(fast_interval: int = 60, slow_interval: int = 300, no_notify: bool
     last_full_scan = 0
     while True:
         if not is_trading_time():
-            now = datetime.now()
+            now = datetime.now(tz=timezone(timedelta(hours=8)))
             if now.weekday() >= 5 or (now.hour, now.minute) >= TRADING_END:
                 log("收盘了，监控停止。")
                 send_notification("市场监控", "收盘了，明天继续")
@@ -214,7 +214,7 @@ def run_daily_summary(no_notify: bool = False):
     if not result:
         return
     sectors, breadth = result["sectors"], result["breadth"]
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
     for s in sectors:
         store.save_sector_daily({
             "sector_name": s["sector_name"], "date": today,
