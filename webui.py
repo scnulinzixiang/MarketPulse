@@ -20,6 +20,12 @@ import fetcher
 from analysis import compute_sector_aggregates, compute_market_breadth, analyze_sector_trends
 
 _scan_lock = threading.Lock()
+_scan_status = {"state": "idle", "msg": "", "pct": 0}
+
+
+def set_status(state: str, msg: str = "", pct: int = 0):
+    global _scan_status
+    _scan_status = {"state": state, "msg": msg, "pct": pct}
 
 
 def get_latest_snapshot():
@@ -136,6 +142,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(fetcher.fetch_stock_moneyflow_top(20))
         elif self.path == "/api/ai":
             self._generate_ai()
+        elif self.path == "/api/status":
+            self._json_response(_scan_status)
         else:
             self._serve_html()
 
@@ -149,13 +157,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _run_scan(self):
         """在后台线程中执行扫描"""
         def scan():
+            set_status("scanning", "获取全市场股票列表...", 5)
             with _scan_lock:
                 try:
                     if store.get_stock_count() == 0:
                         m.ensure_stock_list()
+                    set_status("scanning", "获取全市场行情(5000只)...", 15)
                     m.run_scan_and_report(no_notify=True)
+                    set_status("done", "扫描完成", 100)
                 except Exception as e:
+                    set_status("error", f"扫描异常: {e}", 0)
                     print(f"Scan error: {e}")
+                # 5秒后自动回到idle
+                def reset():
+                    time.sleep(5)
+                    if _scan_status["state"] == "done":
+                        set_status("idle", "", 0)
+                threading.Thread(target=reset, daemon=True).start()
         t = threading.Thread(target=scan, daemon=True)
         t.start()
         self._json_response({"status": "started"})
@@ -270,6 +288,14 @@ canvas{display:block;width:100%;height:240px}
 .inflow{color:#22c55e}
 .outflow{color:#ef4444}
 
+/* Progress Bar */
+.status-bar{display:flex;align-items:center;gap:12px;padding:8px 0;margin-bottom:12px;min-height:32px}
+.status-msg{font-size:13px;color:#888;flex-shrink:0}
+.progress-track{flex:1;height:4px;background:#1e1e2e;border-radius:2px;overflow:hidden}
+.progress-fill{height:100%;background:linear-gradient(90deg,#6366f1,#818cf8);border-radius:2px;transition:width .5s ease}
+.progress-fill.done{background:linear-gradient(90deg,#22c55e,#4ade80)}
+.progress-fill.error{background:linear-gradient(90deg,#ef4444,#f87171)}
+
 /* AI Commentary */
 .ai-card{background:linear-gradient(135deg,#1a1a26,#1a1a2e);border:1px solid #2a2a4a;border-radius:10px;
   padding:16px;margin-bottom:20px}
@@ -294,6 +320,12 @@ canvas{display:block;width:100%;height:240px}
     <div>
       <button class="refresh-btn" id="scanBtn" onclick="triggerScan()">🔄 重新扫描</button>
     </div>
+  </div>
+
+  <!-- 状态进度条 -->
+  <div class="status-bar" id="statusBar" style="display:none">
+    <span class="status-msg" id="statusMsg">加载中…</span>
+    <div class="progress-track"><div class="progress-fill" id="progressFill" style="width:0%"></div></div>
   </div>
 
   <!-- 概览卡片 -->
@@ -580,9 +612,27 @@ async function refreshAll() {
   renderMoneyflow(moneyflow);
 }
 
+// 状态轮询
+async function pollStatus() {
+  const s = await fetchJSON('/api/status');
+  if (!s) return;
+  const bar = document.getElementById('statusBar');
+  const msg = document.getElementById('statusMsg');
+  const fill = document.getElementById('progressFill');
+  if (s.state === 'idle') {
+    bar.style.display = 'none';
+    return;
+  }
+  bar.style.display = 'flex';
+  msg.textContent = s.msg || '';
+  fill.style.width = s.pct + '%';
+  fill.className = 'progress-fill' + (s.state === 'done' ? ' done' : '') + (s.state === 'error' ? ' error' : '');
+}
+
 // 初始化 + 自动刷新
 refreshAll();
 autoTimer = setInterval(refreshAll, 10000);
+setInterval(pollStatus, 2000);
 
 // 窗口大小变化时重绘图表
 window.addEventListener('resize', () => { if (sectorsCache) renderChart(sectorsCache); });
@@ -614,8 +664,6 @@ def main():
     threading.Thread(target=initial_scan, daemon=True).start()
 
     # 双循环自动扫描
-    # - 快循环(60s): 热点池300只，秒级完成
-    # - 慢循环(5min): 全量5000只+资金流向
     def auto_scan_loop():
         last_full = 0
         while True:
@@ -625,6 +673,7 @@ def main():
             now = time.time()
             try:
                 # 快循环：热点池
+                set_status("scanning", "更新热点池(300只)...", 10)
                 with _scan_lock:
                     hot = fetcher.fetch_top_stocks_by_amount(300)
                     if hot:
@@ -632,9 +681,15 @@ def main():
                 # 慢循环：全量
                 if now - last_full >= args.scan_interval:
                     last_full = now
+                    set_status("scanning", "全量扫描(5000只+资金流向)...", 30)
                     with _scan_lock:
                         m.run_scan_and_report(no_notify=True)
-                        print(f"[慢] 全量扫描完成", flush=True)
+                    set_status("done", "数据已更新", 100)
+                    def reset():
+                        time.sleep(5)
+                        if _scan_status["state"] == "done":
+                            set_status("idle", "", 0)
+                    threading.Thread(target=reset, daemon=True).start()
             except Exception as e:
                 print(f"[Scan] {e}", flush=True)
 
