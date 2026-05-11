@@ -504,12 +504,12 @@ function renderMoneyflow(sectors) {
   if (!sectors || !sectors.length) return;
   const inflow = [...sectors].filter(s => s.main_net_inflow > 0).slice(0, 8);
   const outflow = [...sectors].filter(s => s.main_net_inflow < 0).slice(-8).reverse();
-  document.querySelector("#inflowTable tbody").innerHTML = inflow.length
-    ? inflow.map(s => "<tr><td>"+s.sector_name+"</td><td class="inflow" style="text-align:right">+"+s.main_net_inflow.toFixed(1)+"亿</td><td style="text-align:right;color:#888">"+s.main_net_ratio.toFixed(1)+"%</td></tr>").join("")
-    : "<tr><td colspan="3" style="text-align:center;color:#555">暂无净流入</td></tr>";
-  document.querySelector("#outflowTable tbody").innerHTML = outflow.length
-    ? outflow.map(s => "<tr><td>"+s.sector_name+"</td><td class="outflow" style="text-align:right">"+s.main_net_inflow.toFixed(1)+"亿</td><td style="text-align:right;color:#888">"+s.main_net_ratio.toFixed(1)+"%</td></tr>").join("")
-    : "<tr><td colspan="3" style="text-align:center;color:#555">暂无净流出</td></tr>";
+  document.querySelector('#inflowTable tbody').innerHTML = inflow.length
+    ? inflow.map(s => '<tr><td>'+s.sector_name+'</td><td class=inflow style=text-align:right>+'+s.main_net_inflow.toFixed(1)+'亿</td><td style=text-align:right;color:#888>'+s.main_net_ratio.toFixed(1)+'%</td></tr>').join('')
+    : '<tr><td colspan=3 style=text-align:center;color:#555>暂无净流入</td></tr>';
+  document.querySelector('#outflowTable tbody').innerHTML = outflow.length
+    ? outflow.map(s => '<tr><td>'+s.sector_name+'</td><td class=outflow style=text-align:right>'+s.main_net_inflow.toFixed(1)+'亿</td><td style=text-align:right;color:#888>'+s.main_net_ratio.toFixed(1)+'%</td></tr>').join('')
+    : '<tr><td colspan=3 style=text-align:center;color:#555>暂无净流出</td></tr>';
 }
 
 // AI 点评（调用服务器端 /api/ai，key 不暴露）
