@@ -59,6 +59,34 @@ def generate_market_commentary(
     moneyflow_sectors: list[dict],
     moneyflow_stocks: list[dict],
 ) -> Optional[str]:
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(tz=timezone(timedelta(hours=8)))
+    hour, minute = now.hour, now.minute
+    weekday = now.weekday()
+    weekday_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    weekday_str = weekday_names[weekday] if weekday < 7 else ""
+
+    # 判断市场时段
+    if weekday >= 5:
+        session = "周末休市"
+    elif hour < 9 or (hour == 9 and minute < 15):
+        session = "盘前"
+    elif hour < 11 or (hour == 11 and minute <= 30):
+        if hour == 9 and minute < 25:
+            session = "集合竞价"
+        elif hour == 9 and minute < 30:
+            session = "开盘前等待"
+        else:
+            session = "早盘交易中"
+    elif hour < 13:
+        session = "午间休市"
+    elif hour < 15:
+        session = "下午交易中"
+    else:
+        session = "收盘后"
+
+    time_context = f"{weekday_str} {now.strftime('%Y-%m-%d %H:%M')}（{session}）"
+
     sorted_sectors = sorted(sectors, key=lambda x: x.get("avg_change", 0), reverse=True)
     top_gainers = sorted_sectors[:5]
     top_losers = sorted_sectors[-5:] if len(sorted_sectors) >= 5 else sorted_sectors
@@ -81,6 +109,7 @@ def generate_market_commentary(
     amount = breadth.get("total_amount", 0)
 
     prompt = (
+        f"当前时间：{time_context}\n"
         f"大盘概况：上涨{up}/下跌{down}，涨停{limit_up}/跌停{limit_down}，成交额{amount:.0f}亿\n"
         f"领涨板块：{gainer_str}\n"
         f"弱势板块：{loser_str}\n"
@@ -90,7 +119,7 @@ def generate_market_commentary(
     )
 
     messages = [
-        {"role": "system", "content": "你是一名专业的A股市场分析师，回复简洁精准，200字内。"},
+        {"role": "system", "content": "你是一名专业的A股市场分析师，回复简洁精准，200字内。注意当前时间和市场阶段，给出与该时段相适应的分析判断。"},
         {"role": "user", "content": prompt},
     ]
     return _call_deepseek(messages)

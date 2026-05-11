@@ -101,6 +101,39 @@ def _extract_num(code: str) -> int:
         return 0
 
 
+def get_board_type(code: str) -> str:
+    """根据股票代码判断所属板块
+    返回: 'main_sh' 上证主板, 'main_sz' 深证主板, 'gem' 创业板, 'star' 科创板, 'bj' 北交所
+    """
+    short = _extract_short_code(code)
+    if not short:
+        return "other"
+    if short.startswith("68"):
+        return "star"       # 科创板 20%
+    if short.startswith("30"):
+        return "gem"        # 创业板 20%
+    if short.startswith("8") or short.startswith("4"):
+        return "bj"         # 北交所 30%
+    if short.startswith("60"):
+        return "main_sh"    # 上证主板 10%
+    if short.startswith("00"):
+        return "main_sz"    # 深证主板 10%
+    return "other"
+
+
+def get_limit_pct(code: str) -> float:
+    """获取个股的涨跌停限制百分比"""
+    board = get_board_type(code)
+    limits = {
+        "main_sh": 9.98,   # 主板 10%
+        "main_sz": 9.98,
+        "gem": 19.98,      # 创业板 20%
+        "star": 19.98,     # 科创板 20%
+        "bj": 29.98,       # 北交所 30%
+    }
+    return limits.get(board, 9.98)
+
+
 # ── 板块聚合 ──────────────────────────────────────────────────────────────
 
 def compute_sector_aggregates(quotes: dict, market_total: Optional[dict] = None) -> list[dict]:
@@ -153,22 +186,28 @@ def compute_sector_aggregates(quotes: dict, market_total: Optional[dict] = None)
 # ── 市场广度分析 ──────────────────────────────────────────────────────────
 
 def compute_market_breadth(quotes: dict) -> dict:
-    """计算市场整体指标"""
-    all_changes = [s.get("change_pct", 0) for s in quotes.values()
+    """计算市场整体指标，按板块区分涨跌停"""
+    all_changes = [(code, s.get("change_pct", 0)) for code, s in quotes.items()
                    if s.get("change_pct") is not None]
     all_amounts = [s.get("amount", 0) for s in quotes.values()]
 
     if not all_changes:
         return {"total": 0, "up": 0, "down": 0, "flat": 0, "total_amount": 0}
 
-    up = sum(1 for c in all_changes if c > 0)
-    down = sum(1 for c in all_changes if c < 0)
-    flat = sum(1 for c in all_changes if c == 0)
+    up = sum(1 for _, c in all_changes if c > 0)
+    down = sum(1 for _, c in all_changes if c < 0)
+    flat = sum(1 for _, c in all_changes if c == 0)
     total_amount = sum(all_amounts)
 
-    # 涨停/跌停
-    limit_up = sum(1 for c in all_changes if c >= MARKET_BREADTH_CONFIG["limit_up"])
-    limit_down = sum(1 for c in all_changes if c <= MARKET_BREADTH_CONFIG["limit_down"])
+    # 按板块区分涨跌停判断
+    limit_up = 0
+    limit_down = 0
+    for code, cp in all_changes:
+        limit_pct = get_limit_pct(code)
+        if cp >= limit_pct:
+            limit_up += 1
+        elif cp <= -limit_pct:
+            limit_down += 1
 
     up_ratio = up / len(all_changes) if all_changes else 0
 

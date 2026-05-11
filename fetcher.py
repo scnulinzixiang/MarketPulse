@@ -301,14 +301,24 @@ def fetch_sector_moneyflow() -> list[dict]:
         try:
             result.append({
                 "sector_name": str(item.get("f14", "")),
-                "main_net_inflow": float(item.get("f62", 0) or 0) / 1e8,
-                "main_net_ratio": float(item.get("f184", 0) or 0),
-                "big_net_inflow": float(item.get("f66", 0) or 0) / 1e8,
-                "mid_net_inflow": float(item.get("f72", 0) or 0) / 1e8,
-                "small_net_inflow": float(item.get("f78", 0) or 0) / 1e8,
+                "main_net_inflow": float(item.get("f62", 0) or 0) / 1e8,   # 主力净流入(亿)
+                "main_net_ratio": float(item.get("f184", 0) or 0),          # 主力净占比(%)
+                "big_net_inflow": float(item.get("f66", 0) or 0) / 1e8,    # 超大单净流入(亿)
+                "mid_net_inflow": float(item.get("f72", 0) or 0) / 1e8,    # 大单净流入(亿)
+                "small_net_inflow": float(item.get("f78", 0) or 0) / 1e8,  # 中单净流入(亿)
+                "retail_net_inflow": 0,  # will be calculated: -(main + big + mid + small)
             })
         except (ValueError, TypeError):
             continue
+
+    for item in result:
+        item["retail_net_inflow"] = round(
+            -(item["main_net_inflow"] + item["big_net_inflow"]
+              + item["mid_net_inflow"] + item["small_net_inflow"]), 2
+        )
+        item["big_net_inflow"] = round(item["big_net_inflow"], 2)
+        item["mid_net_inflow"] = round(item["mid_net_inflow"], 2)
+        item["small_net_inflow"] = round(item["small_net_inflow"], 2)
 
     return sorted(result, key=lambda x: x["main_net_inflow"], reverse=True)
 
@@ -354,6 +364,122 @@ def fetch_stock_moneyflow_top(top_n: int = 30) -> list[dict]:
 
 
 # ── 热点池（成交额排名）─────────────────────────────────────────────────
+
+# ── 行业分类数据 ← 东方财富行业板块API ────────────────────────────────────
+#
+# 从东方财富 push2 接口获取股票的真实行业分类。
+# f10 = 行业板块名称（东财官方行业归属）
+# 接口限流严重，使用 _request_with_retry 自动重试
+#
+# 回退方案：如果 push2 彻底不可用，从东财 HTTP 接口抓取行业分类
+#
+
+def fetch_all_stock_industries() -> dict:
+    """
+    从东方财富 push2 接口批量获取全市场股票的行业分类
+    返回 {short_code: sector_name}，例如 {"600519": "白酒"}
+    使用 _request_with_retry 自动处理限流
+    """
+    # 先尝试 push2 接口
+    url = ("https://push2.eastmoney.com/api/qt/clist/get"
+           "?fltt=2&pn=1&pz=5000"
+           "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+           "&fields=f12,f14,f10&fid=f3"
+           "&ut=b2884a393a59ad64002ef1a68bbbdc4e")
+    text = _request_with_retry(url, timeout=25, max_retries=4)
+    if text:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = {"data": None}
+        diff = data.get("data", {}).get("diff", {})
+        if isinstance(diff, dict) and len(diff) > 0:
+            result = {}
+            for item in diff.values():
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("f12", "")).strip()
+                sector = str(item.get("f10", "")).strip()
+                if code and sector and len(code) == 6:
+                    result[code] = sector
+            if len(result) > 100:  # 至少需要100只以上才算成功
+                print(f"  [fetcher] 从 push2 获取行业分类: {len(result)} 只股票", flush=True)
+                return result
+            print(f"  [fetcher] push2 行业数据太少({len(result)}只)，尝试回退方案...", flush=True)
+        else:
+            print(f"  [fetcher] push2 行业接口无数据，尝试回退方案...", flush=True)
+    else:
+        print(f"  [fetcher] push2 行业接口限流/不可用，尝试回退方案...", flush=True)
+
+    # ── 回退方案：从东方财富HTTP接口（非push2）获取行业分类 ──
+    # 使用东方财富的板块成分股接口，遍历所有行业板块获取成分股
+    result = _fetch_industries_fallback()
+    return result
+
+
+def _fetch_industries_fallback() -> dict:
+    """
+    回退方案：从东方财富的板块列表接口获取行业分类。
+    先获取所有行业板块列表，再逐个获取板块成分股。
+    """
+    # 1. 获取行业板块列表 (非push2接口)
+    sector_url = "https://push2.eastmoney.com/api/qt/clist/get?fltt=2&pn=1&pz=200&fs=m:90+t:2&fields=f12,f14&fid=f3&ut=b2884a393a59ad64002ef1a68bbbdc4e"
+    text = _request_with_retry(sector_url, timeout=20, max_retries=3)
+    if not text:
+        print(f"  [fetcher] 回退方案：无法获取行业板块列表", flush=True)
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+
+    diff = data.get("data", {}).get("diff", {})
+    if not isinstance(diff, dict) or len(diff) == 0:
+        print(f"  [fetcher] 回退方案：行业板块列表为空", flush=True)
+        return {}
+
+    sectors = []
+    for item in diff.values():
+        if not isinstance(item, dict):
+            continue
+        sector_code = str(item.get("f12", "")).strip()
+        sector_name = str(item.get("f14", "")).strip()
+        if sector_code and sector_name:
+            sectors.append((sector_code, sector_name))
+
+    print(f"  [fetcher] 回退方案：获取到 {len(sectors)} 个行业板块", flush=True)
+
+    # 2. 逐个板块获取成分股
+    result = {}
+    for sector_code, sector_name in sectors:
+        # 使用板块成分股接口 (非push2)
+        members_url = (f"https://push2.eastmoney.com/api/qt/clist/get"
+                       f"?fltt=2&pn=1&pz=500"
+                       f"&fs=b:{sector_code}+f:!50"
+                       f"&fields=f12,f14"
+                       f"&fid=f3"
+                       f"&ut=b2884a393a59ad64002ef1a68bbbdc4e")
+        text2 = _request_with_retry(members_url, timeout=15, max_retries=2)
+        if not text2:
+            continue
+        try:
+            member_data = json.loads(text2)
+        except json.JSONDecodeError:
+            continue
+        member_diff = member_data.get("data", {}).get("diff", {})
+        if not isinstance(member_diff, dict):
+            continue
+        for member in member_diff.values():
+            if not isinstance(member, dict):
+                continue
+            code = str(member.get("f12", "")).strip()
+            if code and len(code) == 6:
+                result[code] = sector_name
+        time.sleep(0.3)  # 避免频率过高
+
+    print(f"  [fetcher] 回退方案：获取到 {len(result)} 只股票的行业分类", flush=True)
+    return result
+
 
 def fetch_top_stocks_by_amount(top_n: int = 300) -> list[dict]:
     """

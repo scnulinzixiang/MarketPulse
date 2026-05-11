@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import store
 import main as m
 import fetcher
-from analysis import compute_sector_aggregates, compute_market_breadth, analyze_sector_trends
+from analysis import compute_sector_aggregates, compute_market_breadth, analyze_sector_trends, score_trend_strength
 
 _scan_lock = threading.Lock()
 _scan_status = {"state": "idle", "msg": "", "pct": 0}
@@ -136,9 +136,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 overview["bar_color"] = bar_color
             self._json_response(overview)
         elif self.path == "/api/moneyflow/sectors":
-            self._json_response(fetcher.fetch_sector_moneyflow())
+            # 东方财富 push2 资金流向板块数据，失败时返回空列表+error字段
+            data = fetcher.fetch_sector_moneyflow()
+            if not data:
+                self._json_response({"error": "数据源限流", "data": []})
+            else:
+                self._json_response(data)
         elif self.path == "/api/moneyflow/stocks":
-            self._json_response(fetcher.fetch_stock_moneyflow_top(20))
+            # 不再依赖 push2，改为从最新快照按成交额排序
+            stocks = self._get_hot_stocks_from_snapshots(20)
+            self._json_response(stocks)
+        elif self.path == "/api/hot_stocks":
+            # 十大热门股：从最新快照按成交额排序取前10
+            hot = self._get_hot_stocks_from_snapshots(10)
+            self._json_response(hot)
+        elif self.path == "/api/sector/kline":
+            self._sector_kline()
+        elif self.path == "/api/sector/trend":
+            self._sector_trend_scores()
         elif self.path == "/api/ai":
             self._generate_ai()
         elif self.path == "/api/status":
@@ -176,6 +191,59 @@ class DashboardHandler(BaseHTTPRequestHandler):
         t = threading.Thread(target=scan, daemon=True)
         t.start()
         self._json_response({"status": "started"})
+
+    def _sector_kline(self):
+        """返回板块K线走势数据（日线）"""
+        from urllib.parse import urlparse, parse_qs
+        params = parse_qs(urlparse(self.path).query)
+        sector = params.get("sector", [None])[0]
+        days = int(params.get("days", [10])[0])
+        if not sector:
+            self._json_response([])
+            return
+        sector = sector.replace("'", "").replace('"', "")
+        daily_data = store.get_sector_daily(sector, days_back=days)
+        daily_data.reverse()  # 按时间正序返回
+        self._json_response(daily_data)
+
+    def _sector_trend_scores(self):
+        """返回所有板块的趋势强度评分"""
+        daily_data = store.get_all_sector_daily(days_back=10)
+        scores = []
+        for sector_name, data in daily_data.items():
+            if len(data) < 3:
+                continue
+            score = score_trend_strength(data)
+            scores.append({
+                "sector_name": sector_name,
+                "trend_score": score,
+                "data_points": len(data),
+            })
+        scores.sort(key=lambda x: x["trend_score"], reverse=True)
+        self._json_response(scores[:50])
+
+    @staticmethod
+    def _get_hot_stocks_from_snapshots(top_n: int = 10) -> list[dict]:
+        """从最新快照按成交额排序获取热门股（腾讯实时行情数据源）"""
+        try:
+            conn = store.get_conn()
+            rows = conn.execute("""
+                SELECT code, name, price, change_pct, amount, volume, turnover_rate
+                FROM snapshots
+                WHERE ts = (SELECT MAX(ts) FROM snapshots)
+                  AND amount > 0
+                ORDER BY amount DESC
+                LIMIT ?
+            """, (top_n,)).fetchall()
+            conn.close()
+            result = []
+            for r in rows:
+                item = dict(r)
+                item["source"] = "腾讯实时行情"
+                result.append(item)
+            return result
+        except Exception:
+            return []
 
     def _generate_ai(self):
         """生成 AI 市场点评（服务器端调用 DeepSeek，key 不暴露给前端）"""
@@ -295,6 +363,9 @@ canvas{display:block;width:100%;height:240px}
 .progress-fill.done{background:linear-gradient(90deg,#22c55e,#4ade80)}
 .progress-fill.error{background:linear-gradient(90deg,#ef4444,#f87171)}
 
+/* Trend Score Mini Bar */
+.trend-bar{display:inline-block;height:3px;border-radius:2px;vertical-align:middle;margin-right:4px;min-width:2px}
+
 /* AI Commentary */
 .ai-card{background:linear-gradient(135deg,#1a1a26,#1a1a2e);border:1px solid #2a2a4a;border-radius:10px;
   padding:16px;margin-bottom:20px}
@@ -348,6 +419,7 @@ canvas{display:block;width:100%;height:240px}
           <th style="text-align:right">上涨/总数</th>
           <th style="text-align:right">成交额(万)</th>
           <th style="text-align:right">趋势</th>
+          <th style="text-align:right">趋势分</th>
         </tr>
       </thead>
       <tbody id="sectorBody"></tbody>
@@ -356,23 +428,43 @@ canvas{display:block;width:100%;height:240px}
 
   <!-- 资金流向 -->
   <div class="chart-container">
-    <h3>主力资金流向 <span style="font-weight:400;color:#666;font-size:12px">东方财富数据</span></h3>
+    <h3>主力资金流向 <span style="font-weight:400;color:#666;font-size:12px">东方财富数据 · 来源:主力/大户/散户</span></h3>
     <div class="mf-grid">
       <div>
         <h4 style="color:#22c55e;font-size:13px;margin-bottom:8px">净流入 TOP</h4>
         <table class="mf-table" id="inflowTable">
-          <thead><tr><th>板块</th><th style="text-align:right">主力净流入</th><th style="text-align:right">净占比</th></tr></thead>
+          <thead><tr><th>板块</th><th style="text-align:right">主力净流入</th><th style="text-align:right">净占比</th><th style="text-align:right">来源</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
       <div>
         <h4 style="color:#ef4444;font-size:13px;margin-bottom:8px">净流出 TOP</h4>
         <table class="mf-table" id="outflowTable">
-          <thead><tr><th>板块</th><th style="text-align:right">主力净流出</th><th style="text-align:right">净占比</th></tr></thead>
+          <thead><tr><th>板块</th><th style="text-align:right">主力净流出</th><th style="text-align:right">净占比</th><th style="text-align:right">来源</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
     </div>
+  </div>
+
+  <!-- 十大热门股（成交额排名） -->
+  <div class="chart-container" id="hotStocksContainer" style="display:none">
+    <h3>十大热门股 <span style="font-weight:400;color:#666;font-size:12px">按成交额排序 · 腾讯实时行情</span></h3>
+    <table class="sector-table" id="hotStocksTable">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>代码</th>
+          <th>名称</th>
+          <th style="text-align:right">最新价</th>
+          <th style="text-align:right">涨跌幅</th>
+          <th style="text-align:right">成交额(亿)</th>
+          <th style="text-align:right">换手率</th>
+          <th style="text-align:right">数据源</th>
+        </tr>
+      </thead>
+      <tbody id="hotStocksBody"></tbody>
+    </table>
   </div>
 
   <!-- AI 点评 -->
@@ -439,11 +531,15 @@ function renderOverview(data) {
 }
 
 // 渲染板块排名
-function renderSectors(sectors) {
+function renderSectors(sectors, trendScores) {
   const tbody = document.getElementById('sectorBody');
   if (!sectors.length) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666;padding:20px">暂无板块数据</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#666;padding:20px">暂无板块数据</td></tr>';
     return;
+  }
+  const scoreMap = {};
+  if (trendScores) {
+    trendScores.forEach(s => { scoreMap[s.sector_name] = s.trend_score; });
   }
   const sorted = [...sectors].sort((a,b) => b.avg_change - a.avg_change);
   tbody.innerHTML = sorted.map((s,i) => {
@@ -453,6 +549,11 @@ function renderSectors(sectors) {
     const barW = Math.min(Math.abs(s.avg_change) * 8, 80);
     const barCol = s.avg_change > 0 ? '#22c55e' : s.avg_change < 0 ? '#ef4444' : '#555';
     const ratio = s.up_count + s.down_count > 0 ? (s.up_count / (s.up_count + s.down_count) * 100).toFixed(0) : '--';
+    const ts = scoreMap[s.sector_name];
+    const tsDisplay = ts !== undefined ? (ts > 0 ? '+' : '') + ts.toFixed(1) : '--';
+    const tsCls = ts > 1.0 ? 'up' : ts < -1.0 ? 'down' : 'flat';
+    const tsBarW = ts !== undefined ? Math.min(Math.abs(ts) * 8, 40) : 0;
+    const tsBarCol = ts > 0 ? '#22c55e' : ts < 0 ? '#ef4444' : '#555';
     return `<tr>
       <td style="color:#555">${i+1}</td>
       <td><strong>${s.sector_name}</strong></td>
@@ -462,6 +563,7 @@ function renderSectors(sectors) {
       <td style="text-align:right;color:#888">${s.up_count}/${s.stock_count}</td>
       <td style="text-align:right;color:#aaa">${Number(s.total_amount).toLocaleString()}</td>
       <td style="text-align:right;color:#888">${ratio}%</td>
+      <td style="text-align:right" class="${tsCls}">${ts !== undefined ? '<span class="trend-bar" style="width:'+tsBarW+'px;background:'+tsBarCol+'"></span>' : ''}${tsDisplay}</td>
     </tr>`;
   }).join('');
 }
@@ -530,17 +632,75 @@ function renderChart(sectors) {
 }
 
 
-// 渲染资金流向
-function renderMoneyflow(sectors) {
-  if (!sectors || !sectors.length) return;
+// 渲染资金流向（含资金来源标注）
+function renderMoneyflow(data) {
+  // data may be null, undefined, or {error: "...", data: []}
+  let sectors = data;
+  if (!data) { sectors = []; }
+  else if (data.error) {
+    // 数据源限流，显示友好提示
+    document.querySelector('#inflowTable tbody').innerHTML =
+      '<tr><td colspan=4 style=text-align:center;color:#888;padding:12px>数据暂不可用（数据源限流）</td></tr>';
+    document.querySelector('#outflowTable tbody').innerHTML =
+      '<tr><td colspan=4 style=text-align:center;color:#888;padding:12px>数据暂不可用（数据源限流）</td></tr>';
+    return;
+  }
+  if (!Array.isArray(sectors) || !sectors.length) {
+    document.querySelector('#inflowTable tbody').innerHTML =
+      '<tr><td colspan=4 style=text-align:center;color:#555;padding:12px>暂无资金流向数据</td></tr>';
+    document.querySelector('#outflowTable tbody').innerHTML =
+      '<tr><td colspan=4 style=text-align:center;color:#555;padding:12px>暂无资金流向数据</td></tr>';
+    return;
+  }
   const inflow = [...sectors].filter(s => s.main_net_inflow > 0).slice(0, 8);
   const outflow = [...sectors].filter(s => s.main_net_inflow < 0).slice(-8).reverse();
+
+  function sourceLabel(s) {
+    // 判断最大资金来源
+    const sources = [
+      { name: '主力', val: s.main_net_inflow },
+      { name: '超大单', val: s.big_net_inflow || 0 },
+      { name: '中单', val: s.mid_net_inflow || 0 },
+      { name: '散户', val: s.retail_net_inflow || 0 },
+    ];
+    sources.sort((a,b) => Math.abs(b.val) - Math.abs(a.val));
+    const top = sources[0];
+    return `<span style="color:${top.val > 0 ? '#22c55e' : '#ef4444'};font-size:11px">${top.name}${top.val > 0 ? '+' : ''}${top.val.toFixed(1)}</span>`;
+  }
+
   document.querySelector('#inflowTable tbody').innerHTML = inflow.length
-    ? inflow.map(s => '<tr><td>'+s.sector_name+'</td><td class=inflow style=text-align:right>+'+s.main_net_inflow.toFixed(1)+'亿</td><td style=text-align:right;color:#888>'+s.main_net_ratio.toFixed(1)+'%</td></tr>').join('')
-    : '<tr><td colspan=3 style=text-align:center;color:#555>暂无净流入</td></tr>';
+    ? inflow.map(s => '<tr><td>'+s.sector_name+'</td><td class=inflow style=text-align:right>+'+s.main_net_inflow.toFixed(1)+'亿</td><td style=text-align:right;color:#888>'+s.main_net_ratio.toFixed(1)+'%</td><td style=text-align:right>'+sourceLabel(s)+'</td></tr>').join('')
+    : '<tr><td colspan=4 style=text-align:center;color:#555>暂无净流入</td></tr>';
   document.querySelector('#outflowTable tbody').innerHTML = outflow.length
-    ? outflow.map(s => '<tr><td>'+s.sector_name+'</td><td class=outflow style=text-align:right>'+s.main_net_inflow.toFixed(1)+'亿</td><td style=text-align:right;color:#888>'+s.main_net_ratio.toFixed(1)+'%</td></tr>').join('')
-    : '<tr><td colspan=3 style=text-align:center;color:#555>暂无净流出</td></tr>';
+    ? outflow.map(s => '<tr><td>'+s.sector_name+'</td><td class=outflow style=text-align:right>'+s.main_net_inflow.toFixed(1)+'亿</td><td style=text-align:right;color:#888>'+s.main_net_ratio.toFixed(1)+'%</td><td style=text-align:right>'+sourceLabel(s)+'</td></tr>').join('')
+    : '<tr><td colspan=4 style=text-align:center;color:#555>暂无净流出</td></tr>';
+}
+
+// 渲染热门股（成交额排名）
+function renderHotStocks(data) {
+  const container = document.getElementById('hotStocksContainer');
+  const tbody = document.getElementById('hotStocksBody');
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = 'block';
+  tbody.innerHTML = data.map((s, i) => {
+    const cls = s.change_pct > 0 ? 'up' : s.change_pct < 0 ? 'down' : 'flat';
+    const arrow = s.change_pct > 0 ? '↑' : s.change_pct < 0 ? '↓' : '→';
+    const pct = s.change_pct > 0 ? '+' + s.change_pct.toFixed(2) : s.change_pct.toFixed(2);
+    const amountYi = s.amount ? (s.amount / 10000).toFixed(2) : '--';
+    return '<tr>' +
+      '<td style="color:#555">' + (i + 1) + '</td>' +
+      '<td style="color:#888;font-size:11px">' + (s.code || '--') + '</td>' +
+      '<td><strong>' + (s.name || '--') + '</strong></td>' +
+      '<td style="text-align:right;color:#aaa">' + (s.price ? s.price.toFixed(2) : '--') + '</td>' +
+      '<td class="' + cls + '" style="text-align:right">' + arrow + ' ' + pct + '%</td>' +
+      '<td style="text-align:right;color:#60a5fa">' + amountYi + '亿</td>' +
+      '<td style="text-align:right;color:#888">' + (s.turnover_rate ? s.turnover_rate.toFixed(2) + '%' : '--') + '</td>' +
+      '<td style="text-align:right;color:#555;font-size:11px">' + (s.source || '腾讯行情') + '</td>' +
+      '</tr>';
+  }).join('');
 }
 
 // AI 点评（调用服务器端 /api/ai，key 不暴露）
@@ -599,16 +759,19 @@ let autoTimer;
 let sectorsCache = null;
 
 async function refreshAll() {
-  const [overview, sectors, moneyflow] = await Promise.all([
+  const [overview, sectors, moneyflow, trendScores, hotStocks] = await Promise.all([
     fetchJSON('/api/overview'),
     fetchJSON('/api/sectors'),
-    fetchJSON('/api/moneyflow/sectors')
+    fetchJSON('/api/moneyflow/sectors'),
+    fetchJSON('/api/sector/trend'),
+    fetchJSON('/api/hot_stocks'),
   ]);
   sectorsCache = sectors;
   renderOverview(overview);
-  renderSectors(sectors);
+  renderSectors(sectors, trendScores);
   renderChart(sectors);
   renderMoneyflow(moneyflow);
+  renderHotStocks(hotStocks);
 }
 
 // 状态轮询
@@ -648,8 +811,30 @@ def main():
 
     store.init_db()
 
-    # 确保股票池就绪
-    m.ensure_stock_list()
+    # 如果 stock_industries 表为空，使用本地规则填充
+    def ensure_stock_industries():
+        try:
+            cnt = store.get_stock_industries_count()
+            if cnt < 3000:
+                print(f"  [webui] 行业分类表仅有 {cnt} 条记录，启动本地规则填充...")
+                n = store.populate_stock_industries_locally()
+                print(f"  [webui] 本地规则填充完成: {n} 只股票已归类")
+            else:
+                print(f"  [webui] 行业分类表已有 {cnt} 条记录")
+        except Exception as e:
+            print(f"  [webui] 行业分类初始化异常: {e}")
+
+    # 后台获取股票池（不阻塞服务器启动）
+    def ensure_stocks_background():
+        try:
+            m.ensure_stock_list()
+        except Exception as e:
+            print(f"股票池获取异常: {e}")
+
+    threading.Thread(target=ensure_stocks_background, daemon=True).start()
+
+    # 后台填充行业分类
+    threading.Thread(target=ensure_stock_industries, daemon=True).start()
 
     # 后台初始扫描（不阻塞服务器启动）
     def initial_scan():

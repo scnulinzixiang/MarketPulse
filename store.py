@@ -41,6 +41,11 @@ def init_db():
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS stock_industries (
+            code TEXT PRIMARY KEY,
+            sector_name TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT NOT NULL,
@@ -297,3 +302,100 @@ def get_all_sector_daily(days_back: int = 5) -> dict[str, list[dict]]:
             result[name] = []
         result[name].append(d)
     return result
+
+
+# ── 异动股票接口 ──────────────────────────────────────────────────────────
+
+def get_recent_anomaly_stocks(limit: int = 100) -> list[str]:
+    """获取近期被标记为异动的股票代码列表（供快循环热点池混合策略使用）"""
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT DISTINCT code FROM snapshots
+        WHERE ts = (SELECT MAX(ts) FROM snapshots)
+          AND (change_pct >= 3 OR change_pct <= -3)
+        LIMIT ?
+    """, (limit,)).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+# ── 行业分类数据操作 ──────────────────────────────────────────────────────
+
+def save_stock_industries(industries: dict[str, str]):
+    """批量保存股票行业分类映射 {code: sector_name}"""
+    conn = get_conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO stock_industries (code, sector_name) VALUES (?, ?)",
+        [(code, sector) for code, sector in industries.items()]
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_stock_industries_count() -> int:
+    """获取行业分类表中的记录数"""
+    conn = get_conn()
+    row = conn.execute("SELECT COUNT(*) FROM stock_industries").fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def get_all_stock_industries() -> dict[str, str]:
+    """获取所有行业分类映射"""
+    conn = get_conn()
+    rows = conn.execute("SELECT code, sector_name FROM stock_industries").fetchall()
+    conn.close()
+    return {r["code"]: r["sector_name"] for r in rows}
+
+
+# ── 本地规则填充行业分类 ────────────────────────────────────────────────
+
+def populate_stock_industries_locally(force: bool = False) -> int:
+    """
+    使用本地规则（SECTOR_KEYWORDS + SECTOR_MAP + KNOWN_STOCKS）
+    对全部股票做一次本地分类，写入 stock_industries 表。
+
+    如果表中已有数据且覆盖率>3000只，跳过（除非 force=True）。
+    返回本次写入的股票数量。
+    """
+    from analysis import classify_stock, _extract_short_code
+
+    if not force:
+        cnt = get_stock_industries_count()
+        if cnt > 3000:
+            print(f"  [store] 行业分类表已有 {cnt} 条记录（覆盖率充足），跳过本地填充")
+            return 0
+
+    stocks = get_all_stocks()
+    if not stocks:
+        print("  [store] 股票池为空，无法填充行业分类")
+        return 0
+
+    industries = {}
+    total = len(stocks)
+    seen = set()
+    for i, s in enumerate(stocks):
+        code = s.get("code", "")
+        name = s.get("name", "")
+        if not code or not name:
+            continue
+        short_code = _extract_short_code(code)
+        if short_code in seen:
+            continue
+        seen.add(short_code)
+        sector = classify_stock(code, name)
+        if sector != "其他":
+            industries[short_code] = sector
+        if (i + 1) % 1000 == 0:
+            print(f"  [store] 分类进度: {i+1}/{total}, 已归类: {len(industries)}", flush=True)
+
+    if industries:
+        save_stock_industries(industries)
+        # 刷新 analysis 缓存
+        from analysis import reload_stock_sectors
+        reload_stock_sectors()
+        print(f"  [store] 本地规则填充完成: {len(industries)} 只股票已归类, 跳过 {total - len(industries)} 只", flush=True)
+    else:
+        print("  [store] 本地规则填充结果为空", flush=True)
+
+    return len(industries)

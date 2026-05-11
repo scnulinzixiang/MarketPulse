@@ -70,10 +70,22 @@ def detect_anomalies(quotes: dict) -> list[str]:
     for code, q in quotes.items():
         cp = q.get("change_pct", 0) or 0
         name = q.get("name", "")
+        # 涨跌幅异动
         if cp >= 5:
-            alerts.append(f"{name} 急涨+{cp:.1f}%")
+            msg = f"{name} 急涨+{cp:.1f}%"
         elif cp <= -5:
-            alerts.append(f"{name} 急跌{cp:.1f}%")
+            msg = f"{name} 急跌{cp:.1f}%"
+        else:
+            continue
+        # 放量检测：当日量 > 前5日均量 * 2
+        volume = q.get("volume", 0) or 0
+        if volume > 0:
+            avg_vol = fetcher.fetch_avg_volume(code, days=5)
+            if avg_vol > 0:
+                ratio = volume / avg_vol
+                if ratio >= 2:
+                    msg = f"{msg}(放量{ratio:.1f}倍)"
+        alerts.append(msg)
     return alerts[:10]
 
 
@@ -145,16 +157,29 @@ def main_loop(fast_interval: int = 60, slow_interval: int = 300, no_notify: bool
 
         now_ts = time.time()
 
-        # 快循环：热点池 + 异动
+        # 快循环：混合策略热点池（成交额前200 + 近期异动前100）
         hot_start = time.time()
         try:
-            hot_stocks = fetcher.fetch_top_stocks_by_amount(300)
+            hot_stocks = fetcher.fetch_top_stocks_by_amount(200)
+            hot_map = {}
             if hot_stocks:
-                hot_quotes = {}
                 for s in hot_stocks:
                     code = s.get("code", "")
                     if code:
-                        hot_quotes[code] = {"name": s.get("name", ""), "change_pct": s.get("change_pct", 0)}
+                        hot_map[code] = s
+            # 补充近期异动股票
+            try:
+                anomaly_codes = store.get_recent_anomaly_stocks(100)
+                for sc in anomaly_codes:
+                    if sc not in hot_map:
+                        # 尝试通过全量quotes获取数据（如果已有扫描记录）
+                        hot_map[sc] = {"code": sc, "name": "", "change_pct": 0}
+            except Exception:
+                pass
+            if hot_map:
+                hot_quotes = {}
+                for code, s in hot_map.items():
+                    hot_quotes[code] = {"name": s.get("name", ""), "change_pct": s.get("change_pct", 0)}
                 alerts = detect_anomalies(hot_quotes)
                 if alerts and not no_notify:
                     msg = " | ".join(alerts[:3])
