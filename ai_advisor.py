@@ -11,13 +11,17 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 
 def _get_api_key() -> Optional[str]:
-    return os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    return (
+        os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        or os.environ.get("OPENAI_API_KEY")
+    )
 
 
-def _call_deepseek(messages: list[dict], max_tokens: int = 1024, temperature: float = 0.7) -> Optional[str]:
+def _call_deepseek(messages: list[dict], max_tokens: int = 1024, temperature: float = 0.7) -> str:
     api_key = _get_api_key()
     if not api_key:
-        return None
+        return 'AI点评功能未启用：请设置 DEEPSEEK_API_KEY 环境变量后重启服务'
     url = f"{DEEPSEEK_BASE_URL}/chat/completions"
     data = json.dumps({
         "model": "deepseek-chat",

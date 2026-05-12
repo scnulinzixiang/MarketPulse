@@ -7,9 +7,10 @@
 
 import json
 import re
+import subprocess
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from config import BATCH_SIZE, BATCH_DELAY, SINA_PAGE_SIZE
@@ -63,6 +64,21 @@ def _request_with_retry(url: str, timeout: int = 20, max_retries: int = 3) -> Op
             else:
                 return None
     return None
+
+
+def _request_curl(url: str, timeout: int = 20) -> Optional[str]:
+    """使用 curl 发送 HTTP GET 请求（强制 IPv4），解决 push2 接口在部分环境无法连接的问题。"""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", str(timeout), "-4",
+             "-H", f"User-Agent: {USER_AGENT}", url],
+            capture_output=True, text=True, timeout=timeout + 5
+        )
+        if result.returncode == 0 and result.stdout:
+            return result.stdout
+        return None
+    except Exception:
+        return None
 
 
 # ── 全市场股票列表 ────────────────────────────────────────────────────────
@@ -519,3 +535,128 @@ def fetch_top_stocks_by_amount(top_n: int = 300) -> list[dict]:
         except (ValueError, TypeError):
             continue
     return result
+
+
+# ── 行业分类数据（IPv4 curl 版，解决 push2 限流问题） ──────────────────────
+
+def fetch_stock_industries_v2(pz: int = 500) -> dict:
+    """
+    从东方财富 push2 接口批量获取全市场股票的行业分类。
+    强制使用 IPv4（通过 curl -4），解决部分环境下 push2 连接问题。
+
+    返回 {short_code: sector_name}，例如 {"600519": "白酒Ⅱ"}。
+    f100 = 东财行业（如"白酒Ⅱ"、"软件开发"、"医疗器械"）
+
+    分页参数 pz 控制每页数量，默认 500，最大建议 1000。
+    """
+    base_url = ("https://push2.eastmoney.com/api/qt/clist/get"
+                "?fltt=2&pn={pn}&pz={pz}"
+                "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+                "&fields=f12,f14,f100&fid=f3")
+
+    all_stocks = {}
+    page = 1
+    total_hint = 0
+    empty_pages = 0
+
+    print(f"  [fetcher] 开始获取行业分类（curl IPv4，每页{pz}只）...", flush=True)
+
+    while True:
+        url = base_url.format(pn=page, pz=pz)
+        text = _request_curl(url, timeout=25)
+        if not text:
+            print(f"  [fetcher] 第{page}页请求失败", flush=True)
+            empty_pages += 1
+            if empty_pages >= 2:
+                break
+            page += 1
+            time.sleep(0.5)
+            continue
+
+        empty_pages = 0
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            print(f"  [fetcher] 第{page}页 JSON 解析失败", flush=True)
+            break
+
+        diff = data.get("data", {}).get("diff", {})
+        if total_hint == 0:
+            total_hint = data.get("data", {}).get("total", 0)
+
+        if not isinstance(diff, dict) or len(diff) == 0:
+            print(f"  [fetcher] 第{page}页无数据，停止分页", flush=True)
+            break
+
+        page_count = 0
+        for item in diff.values():
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("f12", "")).strip()
+            sector = str(item.get("f100", "")).strip()
+            if code and sector and len(code) == 6 and code.isdigit():
+                if code not in all_stocks:  # 保留首次出现的分类
+                    all_stocks[code] = sector
+                    page_count += 1
+
+        print(f"  [fetcher]   第{page}页: 新增{page_count}只, 累计{len(all_stocks)}只", flush=True)
+
+        # 如果本页不足 pz，说明已经是最后一页
+        if len(diff) < pz:
+            break
+
+        page += 1
+        time.sleep(0.3)  # 避免频率过高
+
+    print(f"  [fetcher] 行业分类获取完成: {len(all_stocks)} 只股票（总计约{total_hint}只）", flush=True)
+    return all_stocks
+
+
+# ── 新浪财经快讯 ──────────────────────────────────────────────────────────
+
+def fetch_finance_news(knum: int = 20) -> list[dict]:
+    """
+    从新浪财经滚动新闻获取最新财经快讯。
+
+    API: https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2514
+    返回格式: [{title, url, time, date, source}, ...]
+    knum 控制返回条数，默认 20，最大建议 50。
+    """
+    url = f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2514&knum={knum}&page=1"
+    text = _request(url, timeout=15)
+    if not text:
+        return []
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    records = data.get("result", {}).get("data", [])
+    if not isinstance(records, list):
+        return []
+
+    news = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        url_link = str(item.get("url", "")).strip()
+        ctime = str(item.get("ctime", "")).strip()
+        if title and url_link:
+            try:
+                ts = int(ctime)
+                dt = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8)))
+                time_str = dt.strftime("%Y-%m-%d %H:%M")
+                date_str = dt.strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                time_str = ctime
+                date_str = ctime
+            news.append({
+                "title": title,
+                "url": url_link,
+                "time": time_str,
+                "date": date_str,
+                "source": "新浪财经",
+            })
+    return news
