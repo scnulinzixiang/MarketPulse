@@ -66,6 +66,25 @@ def _request_with_retry(url: str, timeout: int = 20, max_retries: int = 3) -> Op
     return None
 
 
+def _request_post(url: str, data: dict, timeout: int = 15) -> Optional[str]:
+    """发送HTTP POST请求（JSON body），返回文本内容"""
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Referer": "https://www.cls.cn/telegraph",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
 def _request_curl(url: str, timeout: int = 20) -> Optional[str]:
     """使用 curl 发送 HTTP GET 请求（强制 IPv4），解决 push2 接口在部分环境无法连接的问题。"""
     try:
@@ -195,7 +214,7 @@ def fetch_quotes_batch(codes: list[str]) -> dict:
             low = float(fields[34]) if fields[34] else 0
             open_p = float(fields[5]) if fields[5] else 0
             volume = float(fields[6]) if fields[6] else 0  # 手
-            amount_str = fields[37] if len(fields) > 37 and fields[37] else fields.get(7, "0")
+            amount_str = fields[37] if len(fields) > 37 and fields[37] else (fields[7] if len(fields) > 7 else "0")
             amount = float(amount_str) if amount_str else 0  # 万元
 
             # 流通市值 -> 换手率估算
@@ -204,7 +223,7 @@ def fetch_quotes_batch(codes: list[str]) -> dict:
             if float_mv > 0 and price > 0:
                 shares = float_mv * 10000 / price  # 流通股本（股）
                 if shares > 0:
-                    turnover_rate = round(volume * 100 / shares * 100, 2)
+                    turnover_rate = round(volume * 100 / shares, 2)
 
             result[code] = {
                 "name": name,
@@ -320,8 +339,8 @@ def fetch_sector_moneyflow() -> list[dict]:
                 "main_net_inflow": float(item.get("f62", 0) or 0) / 1e8,   # 主力净流入(亿)
                 "main_net_ratio": float(item.get("f184", 0) or 0),          # 主力净占比(%)
                 "big_net_inflow": float(item.get("f66", 0) or 0) / 1e8,    # 超大单净流入(亿)
-                "mid_net_inflow": float(item.get("f72", 0) or 0) / 1e8,    # 大单净流入(亿)
-                "small_net_inflow": float(item.get("f78", 0) or 0) / 1e8,  # 中单净流入(亿)
+                "mid_net_inflow": float(item.get("f72", 0) or 0) / 1e8,    # 中单净流入(亿)
+                "small_net_inflow": float(item.get("f78", 0) or 0) / 1e8,  # 小单净流入(亿)
                 "retail_net_inflow": 0,  # will be calculated: -(main + big + mid + small)
             })
         except (ValueError, TypeError):
@@ -618,11 +637,11 @@ def fetch_finance_news(knum: int = 20) -> list[dict]:
     """
     从新浪财经滚动新闻获取最新财经快讯。
 
-    API: https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2514
+    API: https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509
     返回格式: [{title, url, time, date, source}, ...]
     knum 控制返回条数，默认 20，最大建议 50。
     """
-    url = f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2514&knum={knum}&page=1"
+    url = f"https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&knum={knum}&page=1"
     text = _request(url, timeout=15)
     if not text:
         return []
@@ -659,4 +678,71 @@ def fetch_finance_news(knum: int = 20) -> list[dict]:
                 "date": date_str,
                 "source": "新浪财经",
             })
+    return news
+
+
+def fetch_cls_news() -> list[dict]:
+    """
+    从财联社获取加红电报快讯。
+
+    API: POST https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.2
+    返回格式: [{title, url, time, date, source}, ...]
+    """
+    url = "https://www.cls.cn/api/sw?app=CailianpressWeb&os=web&sv=8.4.2"
+    payload = {
+        "type": "telegram",
+        "category": "red",
+        "hasFirstVipArticle": True,
+        "page": 1,
+        "rn": 20,
+    }
+    text = _request_post(url, payload, timeout=15)
+    if not text:
+        return []
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+
+    records = data.get("result", {}).get("data", [])
+    if not isinstance(records, list):
+        return []
+
+    news = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        content = str(item.get("content", "")).strip()
+        ctime = item.get("ctime")
+        cls_id = item.get("id")
+
+        # 标题优先，没有标题用content
+        text_title = title or content
+        if not text_title:
+            continue
+
+        url_link = f"https://www.cls.cn/detail/{cls_id}" if cls_id else "https://www.cls.cn/telegraph"
+
+        if ctime:
+            try:
+                ts = int(ctime) / 1000  # ms → s
+                dt = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=8)))
+                time_str = dt.strftime("%Y-%m-%d %H:%M")
+                date_str = dt.strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                time_str = ""
+                date_str = ""
+        else:
+            time_str = ""
+            date_str = ""
+
+        news.append({
+            "title": text_title,
+            "url": url_link,
+            "time": time_str,
+            "date": date_str,
+            "source": "财联社",
+        })
     return news
