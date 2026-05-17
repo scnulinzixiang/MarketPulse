@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +19,45 @@ import store
 import main as m
 import fetcher
 from analysis import compute_sector_aggregates, compute_market_breadth, analyze_sector_trends, score_trend_strength
+
+
+def populate_stock_industries_from_api() -> int:
+    """使用东方财富API获取全市场股票行业分类并写入数据库"""
+    from analysis import reload_stock_sectors
+
+    # 1. 先确保股票池存在
+    stocks = store.get_all_stocks()
+    if not stocks:
+        print("  [webui] 股票池为空，跳过API行业分类填充", flush=True)
+        return 0
+
+    # 2. 获取API行业数据
+    print(f"  [webui] 正在从东方财富API获取行业分类（共{len(stocks)}只股票）...", flush=True)
+    industries = fetcher.fetch_stock_industries_v2(pz=500)
+
+    if not industries:
+        print("  [webui] API获取行业数据为空，回退到本地规则填充", flush=True)
+        return store.populate_stock_industries_locally()
+
+    # 3. 检查覆盖率
+    stock_codes = {s.get("short_code", "") or s.get("code", "")[-6:] for s in stocks if s.get("code")}
+    api_covered = stock_codes & set(industries.keys())
+    coverage = len(api_covered) / len(stock_codes) * 100 if stock_codes else 0
+    print(f"  [webui] API行业分类: 获取{len(industries)}条, 覆盖{len(api_covered)}/{len(stock_codes)}只({coverage:.1f}%)", flush=True)
+
+    # 4. 写入数据库（只写入股票池中存在的股票）
+    to_save = {code: industries[code] for code in api_covered}
+    store.save_stock_industries(to_save)
+    reload_stock_sectors()
+
+    # 5. 如果API覆盖率不够高，再用本地规则补充
+    if coverage < 85:
+        print(f"  [webui] API覆盖率{coverage:.1f}%不足85%，用本地规则补充...", flush=True)
+        store.populate_stock_industries_locally(force=True)
+
+    new_cnt = store.get_stock_industries_count()
+    print(f"  [webui] 行业分类填充完成: {new_cnt} 条记录", flush=True)
+    return new_cnt
 
 _scan_lock = threading.Lock()
 _scan_status = {"state": "idle", "msg": "", "pct": 0}
@@ -111,6 +151,12 @@ def get_sector_history(days=30):
 # HTTP 处理器
 # ═══════════════════════════════════════════════════════════════════
 
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Threaded version of HTTPServer for concurrent request handling"""
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
@@ -118,7 +164,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json_response(get_market_overview())
         elif self.path == "/api/sectors":
             snap = get_latest_snapshot()
-            self._json_response(snap["sectors"] if snap else [])
+            sectors = snap["sectors"] if snap else []
+            if sectors:
+                # 合并趋势评分
+                daily_data = store.get_all_sector_daily(days_back=10)
+                score_map = {}
+                for sector_name, data in daily_data.items():
+                    if len(data) >= 3:
+                        score_map[sector_name] = score_trend_strength(data)
+                for s in sectors:
+                    s["trend_score"] = score_map.get(s["sector_name"])
+            self._json_response(sectors)
         elif self.path == "/api/history":
             self._json_response(get_sector_history())
         elif self.path.startswith("/api/scan"):
@@ -150,6 +206,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # 十大热门股：从最新快照按成交额排序取前10
             hot = self._get_hot_stocks_from_snapshots(10)
             self._json_response(hot)
+        elif self.path == "/api/news":
+            self._json_response(fetcher.fetch_finance_news(10))
         elif self.path == "/api/sector/kline":
             self._sector_kline()
         elif self.path == "/api/sector/trend":
@@ -267,7 +325,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "limit_up": 0, "limit_down": 0,
                 "total_amount": row["total_amount_yi"] or 0,
             }
-            moneyflow = fetcher.fetch_sector_moneyflow()
+            try:
+                moneyflow = fetcher.fetch_sector_moneyflow()
+            except Exception:
+                moneyflow = []
             from ai_advisor import generate_market_commentary
             commentary = generate_market_commentary(breadth, sectors, moneyflow, [])
             self._json_response({"text": commentary, "ts": str(datetime.now(tz=timezone(timedelta(hours=8))))})
@@ -465,6 +526,12 @@ canvas{display:block;width:100%;height:240px}
       </thead>
       <tbody id="hotStocksBody"></tbody>
     </table>
+  </div>
+
+  <!-- 财经要闻 -->
+  <div class="chart-container" id="newsContainer">
+    <h3>财经要闻 <span style="font-weight:400;color:#666;font-size:12px">新浪财经滚动新闻</span></h3>
+    <div id="newsBody" style="font-size:13px;line-height:1.8"></div>
   </div>
 
   <!-- AI 点评 -->
@@ -759,12 +826,13 @@ let autoTimer;
 let sectorsCache = null;
 
 async function refreshAll() {
-  const [overview, sectors, moneyflow, trendScores, hotStocks] = await Promise.all([
+  const [overview, sectors, moneyflow, trendScores, hotStocks, news] = await Promise.all([
     fetchJSON('/api/overview'),
     fetchJSON('/api/sectors'),
     fetchJSON('/api/moneyflow/sectors'),
     fetchJSON('/api/sector/trend'),
     fetchJSON('/api/hot_stocks'),
+    fetchJSON('/api/news'),
   ]);
   sectorsCache = sectors;
   renderOverview(overview);
@@ -772,6 +840,22 @@ async function refreshAll() {
   renderChart(sectors);
   renderMoneyflow(moneyflow);
   renderHotStocks(hotStocks);
+  renderNews(news);
+}
+
+function renderNews(news) {
+  const container = document.getElementById('newsContainer');
+  if (!container) return;
+  if (!news || !news.length) {
+    container.innerHTML = '<div style="color:#555;padding:8px">暂无新闻</div>';
+    return;
+  }
+  container.innerHTML = news.map(n =>
+    '<div style="padding:6px 0;border-bottom:1px solid #1a1a22;font-size:13px">' +
+    '<span style="color:#888;font-size:11px">['+n.source+']</span> ' +
+    '<a href="'+n.url+'" target="_blank" style="color:#e0e0e0;text-decoration:none">'+n.title+'</a>' +
+    '<span style="float:right;color:#666;font-size:11px">'+n.date+' '+n.time.slice(-5)+'</span></div>'
+  ).join('');
 }
 
 // 状态轮询
@@ -809,16 +893,34 @@ def main():
     parser.add_argument("--scan-interval", type=int, default=120, help="全量扫描间隔(秒)")
     args = parser.parse_args()
 
+    # 手动加载 ~/.hermes/.env 中的环境变量（仅使用标准库）
+    env_path = os.path.expanduser("~/.hermes/.env")
+    if os.path.isfile(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                # 跳过空行和注释
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    key = key.strip()
+                    val = val.strip()
+                    # 清理可能的引号和换行
+                    val = val.strip().strip("\"'")
+                    os.environ.setdefault(key, val)
+
     store.init_db()
 
-    # 如果 stock_industries 表为空，使用本地规则填充
+    # 如果 stock_industries 表为空，使用API填充行业分类
     def ensure_stock_industries():
         try:
             cnt = store.get_stock_industries_count()
             if cnt < 3000:
-                print(f"  [webui] 行业分类表仅有 {cnt} 条记录，启动本地规则填充...")
-                n = store.populate_stock_industries_locally()
-                print(f"  [webui] 本地规则填充完成: {n} 只股票已归类")
+                print(f"  [webui] 行业分类表仅有 {cnt} 条记录，启动API行业分类填充...")
+                # 优先使用 API 获取真实行业分类
+                n = populate_stock_industries_from_api()
+                print(f"  [webui] API行业分类填充完成: {n} 只股票已归类")
             else:
                 print(f"  [webui] 行业分类表已有 {cnt} 条记录")
         except Exception as e:
@@ -879,7 +981,7 @@ def main():
 
     threading.Thread(target=auto_scan_loop, daemon=True).start()
 
-    server = HTTPServer(("0.0.0.0", args.port), DashboardHandler)
+    server = ThreadedHTTPServer(("0.0.0.0", args.port), DashboardHandler)
     print(f"")
     print(f"  🌐 全市场资金趋势仪表盘")
     print(f"  ─────────────────────────")
